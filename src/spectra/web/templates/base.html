@@ -175,7 +175,7 @@
         async function loadCurrency() {
             if (!defaultCurrency) {
                 const response = await fetch('/api/settings');
-                defaultCurrency = await response.json()['currency'];
+                defaultCurrency = (await response.json())['currency'];
             }
             return defaultCurrency;
         }

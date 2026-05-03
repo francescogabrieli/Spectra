@@ -33,6 +33,7 @@
 {% block scripts %}
 <script>
     async function loadBudget() {
+        await loadCurrency();
         const res = await fetch('/api/budget');
         const data = await res.json();
 

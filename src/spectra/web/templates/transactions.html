@@ -90,6 +90,7 @@
     }
 
     async function loadTransactions(page = 1) {
+        await loadCurrency();
         currentPage = page;
         const filters = currentTransactionFilters();
         const { search, category, dateFrom, dateTo } = filters;

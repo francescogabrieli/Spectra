@@ -152,6 +152,7 @@
 
     async function loadSubscriptions() {
         try {
+            await loadCurrency();
             const res = await fetch('/api/subscriptions');
             const data = await res.json();
 

@@ -105,6 +105,7 @@
     }
 
     async function loadTrends() {
+        await loadCurrency();
         const res = await fetch('/api/trends');
         trendsData = await res.json();
 

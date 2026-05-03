@@ -290,6 +290,7 @@
 
     async function loadDashboard(scope = getScope()) {
         try {
+            await loadCurrency();
             const normalizedScope = normalizeScope(scope);
             updateScopeUI(normalizedScope);
 
