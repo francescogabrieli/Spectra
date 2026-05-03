@@ -7,13 +7,20 @@ import logging
 import re
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger("spectra.ai")
 
 
 # ── Data models ──────────────────────────────────────────────────
+
+
+class CategorySuggestion(BaseModel):
+    """Candidate category returned by the local classifier for review."""
+
+    category: str
+    score: float
 
 
 class CategorisedTransaction(BaseModel):
@@ -29,6 +36,10 @@ class CategorisedTransaction(BaseModel):
     date: str
     id: str  # Hash ID for dedup
     recurring: str = ""   # "Subscription", "Salary/Income", or empty
+    classification_source: str = ""
+    category_confidence: float | None = None
+    category_suggestions: list[CategorySuggestion] = Field(default_factory=list)
+    needs_review: bool = False
 
 
 # ── Prompt ───────────────────────────────────────────────────────
@@ -88,9 +99,11 @@ def _build_user_prompt(
         "TRANSAZIONI DA CLASSIFICARE:",
     ]
     for t in transactions:
+        counterpart = str(t.get("counterpart", "")).strip()
+        counterpart_part = f', controparte: "{counterpart}"' if counterpart else ""
         lines.append(
             f'- descrizione: "{t["raw_description"]}", '
-            f'importo: {t["amount"]}, valuta: {t["currency"]}, data: {t["date"]}'
+            f'importo: {t["amount"]}, valuta: {t["currency"]}, data: {t["date"]}{counterpart_part}'
         )
 
     return "\n".join(lines)

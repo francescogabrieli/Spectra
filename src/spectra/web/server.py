@@ -70,7 +70,6 @@ async def generic_exception_handler(request, exc):
     logger.exception("Unhandled error: %s", exc)
     return _JSONResponse({"error": "Internal server error"}, status_code=500)
 
-
 def _get_db() -> BookmarkDB:
     settings = load_settings()
     return BookmarkDB(settings.db_path)
@@ -869,7 +868,6 @@ async def api_settings():
         cats = db._conn.execute(
             "SELECT DISTINCT category FROM tx_history WHERE category != 'Uncategorized'"
         ).fetchall()
-
     return {
         "provider": settings.ai_provider,
         "currency": effective_currency,
@@ -947,7 +945,6 @@ async def api_update_preferences(request: Request):
         preferences = _load_app_preferences(db)
         effective_currency = _resolve_base_currency(load_settings(), db)
         requires_currency_setup = _requires_base_currency_setup(db)
-
     return {
         "ok": True,
         **preferences,
@@ -1216,6 +1213,7 @@ async def api_upload(file: UploadFile = File(...)):
             rule_count = 0
             for t in new_txns:
                 od = t.raw_description
+                counterpart = str(getattr(t, "counterpart", "") or "")
                 if od in overrides:
                     pre_cat.append(CategorisedTransaction(
                         id=t.id, original_description=od,
@@ -1230,14 +1228,14 @@ async def api_upload(file: UploadFile = File(...)):
 
                 matched_rule = first_matching_rule(
                     category_rules,
-                    clean_name=od,
+                    clean_name=counterpart or od,
                     raw_description=od,
                 )
                 if matched_rule:
                     pre_cat.append(CategorisedTransaction(
                         id=t.id,
                         original_description=od,
-                        clean_name=od,
+                        clean_name=counterpart or od,
                         category=str(matched_rule["category"]),
                         amount=t.amount,
                         currency=t.currency,
@@ -1257,8 +1255,13 @@ async def api_upload(file: UploadFile = File(...)):
 
             if to_process:
                 flat = [
-                    {"raw_description": t.raw_description, "amount": t.amount,
-                     "currency": t.currency, "date": t.date}
+                    {
+                        "raw_description": t.raw_description,
+                        "counterpart": getattr(t, "counterpart", ""),
+                        "amount": t.amount,
+                        "currency": t.currency,
+                        "date": t.date,
+                    }
                     for t in to_process
                 ]
 
@@ -1316,15 +1319,32 @@ async def api_upload(file: UploadFile = File(...)):
                     t.currency = base_currency
 
             # ── Done ───────────────────────────────────────────────
-            preview = [
-                {
-                    "id": t.id, "date": t.date, "merchant": t.clean_name,
-                    "category": t.category, "amount": t.amount,
-                    "currency": t.currency, "recurring": t.recurring,
+            preview = []
+            for t in categorised:
+                row = {
+                    "id": t.id,
+                    "date": t.date,
+                    "merchant": t.clean_name,
+                    "category": t.category,
+                    "amount": t.amount,
+                    "currency": t.currency,
+                    "recurring": t.recurring,
                     "original_description": t.original_description,
                 }
-                for t in categorised
-            ]
+                if getattr(t, "classification_source", ""):
+                    row["classification_source"] = t.classification_source
+                if getattr(t, "category_confidence", None) is not None:
+                    row["category_confidence"] = t.category_confidence
+                if getattr(t, "needs_review", False):
+                    row["needs_review"] = True
+                if getattr(t, "category_suggestions", None):
+                    row["category_suggestions"] = [
+                        suggestion.model_dump()
+                        if hasattr(suggestion, "model_dump")
+                        else dict(suggestion)
+                        for suggestion in t.category_suggestions
+                    ]
+                preview.append(row)
             yield evt(100, f"{len(preview)} transactions ready", done=True,
                       transactions=preview, message=f"{len(preview)} new transactions")
 

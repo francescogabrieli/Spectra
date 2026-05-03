@@ -8,13 +8,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- Docker support with `Dockerfile` + `docker-compose.yml` for one-command local startup (`docker compose up --build`)
-- Support for OFX files.
+- Launcher auto-update on `start` for clean Git clones with fast-forwardable upstream changes; updated launches rebuild the Docker image automatically
+- Upload review now surfaces local classification metadata for uncertain rows, including source badges, confidence, and clickable category suggestions
+- Added generic `counterpart` parsing across imports, with support for dedicated payee/beneficiary columns and fallback extraction from detail/reference text
+### Changed
+- Local ML categorization now trains on weighted hybrid examples (`user overrides` > `merchant memory` > `history` > seed data) and uses richer TF-IDF word + char features
+- Local classification decisions now require both confidence and top-1/top-2 margin before auto-assigning a category; uncertain rows stay reviewable instead of being forced aggressively
+- Added `numpy` as an explicit runtime dependency because the local classifier now imports it directly
+- Improved UX across the web app with a clearer Settings information architecture, guided upload review, and better transaction filter / inbox-zero feedback
+
+---
+
+## [0.4.0] — 2026-03-21
+
+### Highlights
+- One-command local startup with Docker
+- OFX import support
+- Better PDF parsing fallback
+- First-run base currency setup in Settings
+- Improved Docker launchers with real custom port support
+
+### Added
+- Docker support with `Dockerfile` and `docker-compose.yml` for quick local startup
+- OFX file import support
+- First-run setup flow for choosing the base currency before using the app
 
 ### Changed
-- Replaced direct dependency `pdfminer.six` with `pypdf` in `pyproject.toml`
-- PDF parser fallback now uses `pypdf` text extraction while keeping `pdfplumber` table extraction
-- Base currency is now configurable from the Settings UI; on first run with an empty DB, setup is required before using the app
+- Replaced the old `pdfminer.six` dependency with `pypdf`
+- PDF parsing now falls back to `pypdf` text extraction while keeping `pdfplumber` for table extraction
+- Docker launchers now correctly support custom host ports
+- Web assets are now packaged correctly for installable distributions
+- Documentation updated and simplified around local-first startup
+
+### Fixed
+- Fixed packaging so the web dashboard templates and static assets are included correctly
+- Fixed Docker `--port` behavior so launchers no longer open the wrong URL
+- Cleaned up release artifacts and removed the old GitHub Actions workflow
+
+### Notes
+- If you’re starting fresh, the recommended path is Docker: `./spectra start --build`
+- Native mode is still available for local development: `python -m spectra --serve`
+- Spectra stays local-first: no bank logins, no mandatory cloud dependency, and full control over your data
 
 ---
 

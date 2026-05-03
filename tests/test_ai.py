@@ -39,6 +39,21 @@ class TestBuildUserPrompt:
         assert "ESSELUNGA 412" in prompt
         assert "-62.3" in prompt
 
+    def test_includes_counterpart_when_available(self) -> None:
+        prompt = _build_user_prompt(
+            transactions=[
+                {
+                    "raw_description": "SEPA TRANSFER",
+                    "counterpart": "Andre Silva",
+                    "amount": -42.30,
+                    "currency": "EUR",
+                    "date": "2026-02-22",
+                }
+            ],
+            existing_categories=[],
+        )
+        assert 'controparte: "Andre Silva"' in prompt
+
 
 class TestExtractJson:
     """Tests for robust JSON extraction from LLM output."""

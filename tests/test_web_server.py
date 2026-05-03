@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from spectra.ai import CategorySuggestion, CategorisedTransaction
 from spectra.config import Settings
 from spectra.db import BookmarkDB
 from spectra.web import server
@@ -53,6 +55,16 @@ def seed_tx(
             )
         ]
     )
+
+
+def parse_sse_events(raw: str) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for chunk in raw.split("\n\n"):
+        data_line = next((line for line in chunk.splitlines() if line.startswith("data: ")), None)
+        if not data_line:
+            continue
+        events.append(json.loads(data_line[6:]))
+    return events
 
 
 def test_patch_transaction_persists_learning(client: TestClient, web_settings: Settings) -> None:
@@ -326,3 +338,141 @@ def test_confirm_respects_apply_to_future(client: TestClient, web_settings: Sett
         learning = db.get_recent_learning_feedback(limit=10)
         assert len(learning) >= 2
         assert any(event["clean_name"] == "One-off Store" and event["apply_to_future"] is False for event in learning)
+
+
+def test_upload_preview_includes_local_review_metadata(
+    client: TestClient,
+    web_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with BookmarkDB(web_settings.db_path) as db:
+        db.set_app_setting("base_currency", "EUR")
+
+    import spectra.csv_parser as csv_parser
+    import spectra.local_categorizer as local_categorizer
+    import spectra.ml_classifier as ml_classifier
+    import spectra.recurring as recurring
+
+    monkeypatch.setattr(
+        csv_parser,
+        "parse_csv",
+        lambda _path, currency="EUR": [
+            SimpleNamespace(
+                id="upload-local-1",
+                raw_description="MYSTERY STORE 123",
+                amount=-14.2,
+                currency=currency,
+                date="2026-03-15",
+            )
+        ],
+    )
+    monkeypatch.setattr(ml_classifier, "train_classifier", lambda _training_data: object())
+    monkeypatch.setattr(
+        local_categorizer,
+        "categorise_local",
+        lambda _rows, merchant_db, ml_classifier=None: [
+            CategorisedTransaction(
+                id="upload-local-1",
+                original_description="MYSTERY STORE 123",
+                clean_name="Mystery Store",
+                category="Uncategorized",
+                amount=-14.2,
+                currency="EUR",
+                date="2026-03-15",
+                classification_source="fallback",
+                category_confidence=0.19,
+                category_suggestions=[
+                    CategorySuggestion(category="Shopping", score=0.19),
+                    CategorySuggestion(category="Groceries", score=0.18),
+                    CategorySuggestion(category="Food & Dining", score=0.17),
+                ],
+                needs_review=True,
+            )
+        ],
+    )
+    monkeypatch.setattr(recurring, "apply_recurring_tags", lambda _transactions, _history: None)
+
+    response = client.post(
+        "/api/upload",
+        files={"file": ("sample.csv", b"dummy", "text/csv")},
+    )
+    assert response.status_code == 200
+
+    events = parse_sse_events(response.text)
+    final_event = events[-1]
+    preview_row = final_event["transactions"][0]
+    assert preview_row["classification_source"] == "fallback"
+    assert preview_row["needs_review"] is True
+    assert preview_row["category_confidence"] == 0.19
+    assert len(preview_row["category_suggestions"]) == 3
+
+
+def test_upload_preview_omits_local_review_metadata_for_cloud_mode(
+    client: TestClient,
+    web_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    cloud_settings = web_settings.model_copy(
+        update={
+            "ai_provider": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-4o-mini",
+        }
+    )
+    monkeypatch.setattr(server, "load_settings", lambda: cloud_settings)
+
+    with BookmarkDB(web_settings.db_path) as db:
+        db.set_app_setting("base_currency", "EUR")
+
+    import spectra.ai as ai_module
+    import spectra.csv_parser as csv_parser
+    import spectra.recurring as recurring
+
+    monkeypatch.setattr(
+        csv_parser,
+        "parse_csv",
+        lambda _path, currency="EUR": [
+            SimpleNamespace(
+                id="upload-cloud-1",
+                raw_description="SPOTIFY AB",
+                amount=-9.99,
+                currency=currency,
+                date="2026-03-16",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        ai_module,
+        "categorise",
+        lambda _transactions, _existing_categories, **_kwargs: [
+            CategorisedTransaction(
+                id="upload-cloud-1",
+                original_description="SPOTIFY AB",
+                clean_name="Spotify",
+                category="Digital Subscriptions",
+                amount=-9.99,
+                currency="EUR",
+                date="2026-03-16",
+            )
+        ],
+    )
+    monkeypatch.setattr(recurring, "apply_recurring_tags", lambda _transactions, _history: None)
+
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    response = client.post(
+        "/api/upload",
+        files={"file": ("sample.csv", b"dummy", "text/csv")},
+    )
+    assert response.status_code == 200
+
+    events = parse_sse_events(response.text)
+    final_event = events[-1]
+    preview_row = final_event["transactions"][0]
+    assert "classification_source" not in preview_row
+    assert "needs_review" not in preview_row
+    assert "category_suggestions" not in preview_row

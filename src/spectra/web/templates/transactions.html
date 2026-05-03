@@ -2,8 +2,15 @@
 {% block title %}Transactions — Spectra{% endblock %}
 
 {% block content %}
-<h1 class="page-title">Transactions</h1>
-<p class="page-subtitle" id="txSubtitle">Click a category or merchant to edit it</p>
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Transactions</h1>
+        <p class="page-subtitle" id="txSubtitle">Review, search, and fix merchants or categories directly from your ledger.</p>
+    </div>
+    <div class="page-header-actions">
+        <a href="/upload" class="btn btn-secondary btn-sm">Upload more</a>
+    </div>
+</div>
 
 <div class="table-container">
     <div class="table-toolbar">
@@ -13,7 +20,17 @@
         </select>
         <input type="date" id="dateFrom" title="From date">
         <input type="date" id="dateTo" title="To date">
+        <button class="btn btn-secondary btn-sm" type="button" onclick="resetTransactionFilters()">Reset filters</button>
         <button class="btn btn-secondary btn-sm" id="uncatToggleBtn" type="button" onclick="toggleUncategorizedQueue()">Inbox zero: OFF</button>
+    </div>
+
+    <div class="results-summary" id="resultsSummary">
+        <div class="results-summary-badges">
+            <span class="settings-badge local" id="resultsCountBadge">Loading…</span>
+            <span class="settings-badge" id="resultsFilterBadge">No filters</span>
+            <span class="settings-badge warning" id="resultsModeBadge" style="display:none;">Inbox zero</span>
+        </div>
+        <div class="table-cell-muted" id="resultsSummaryText">Loading transactions…</div>
     </div>
 
     <div class="uncategorized-queue" id="uncatQueue" style="display:none;">
@@ -74,10 +91,8 @@
 
     async function loadTransactions(page = 1) {
         currentPage = page;
-        const search = document.getElementById('searchInput').value;
-        const category = document.getElementById('categoryFilter').value;
-        const dateFrom = document.getElementById('dateFrom').value;
-        const dateTo = document.getElementById('dateTo').value;
+        const filters = currentTransactionFilters();
+        const { search, category, dateFrom, dateTo } = filters;
 
         const params = new URLSearchParams({ page, per_page: 50 });
         if (search) params.set('search', search);
@@ -91,11 +106,12 @@
 
         renderTable(data.transactions);
         renderPagination(data.page, data.pages);
+        updateResultsSummary(data, filters);
 
         const subtitle = document.getElementById('txSubtitle');
         subtitle.textContent = uncategorizedOnly
             ? `Inbox zero mode — ${data.total} uncategorized transaction(s)`
-            : 'Click a category or merchant to edit it';
+            : 'Review, search, and fix merchants or categories directly from your ledger.';
 
         const queue = document.getElementById('uncatQueue');
         const queueInfo = document.getElementById('uncatQueueInfo');
@@ -105,15 +121,75 @@
         }
     }
 
+    function currentTransactionFilters() {
+        return {
+            search: document.getElementById('searchInput').value.trim(),
+            category: document.getElementById('categoryFilter').value,
+            dateFrom: document.getElementById('dateFrom').value,
+            dateTo: document.getElementById('dateTo').value,
+            uncategorizedOnly,
+        };
+    }
+
+    function activeFilterCount(filters) {
+        let count = 0;
+        if (filters.search) count += 1;
+        if (filters.category && !filters.uncategorizedOnly) count += 1;
+        if (filters.dateFrom) count += 1;
+        if (filters.dateTo) count += 1;
+        return count;
+    }
+
+    function updateResultsSummary(data, filters) {
+        const countBadge = document.getElementById('resultsCountBadge');
+        const filterBadge = document.getElementById('resultsFilterBadge');
+        const modeBadge = document.getElementById('resultsModeBadge');
+        const summaryText = document.getElementById('resultsSummaryText');
+        if (!countBadge || !filterBadge || !modeBadge || !summaryText) {
+            return;
+        }
+
+        const total = Number(data.total || 0);
+        const filterCount = activeFilterCount(filters);
+        countBadge.textContent = `${total} result${total === 1 ? '' : 's'}`;
+        filterBadge.textContent = filterCount ? `${filterCount} filter${filterCount === 1 ? '' : 's'} active` : 'No filters';
+
+        if (filters.uncategorizedOnly) {
+            modeBadge.style.display = '';
+            summaryText.textContent = 'Only uncategorized transactions are shown so you can reach inbox zero faster.';
+        } else {
+            modeBadge.style.display = 'none';
+            summaryText.textContent = filterCount
+                ? 'Showing the transactions that match your current filters.'
+                : 'Click a merchant or category to edit it in place.';
+        }
+    }
+
+    function resetTransactionFilters() {
+        document.getElementById('searchInput').value = '';
+        document.getElementById('categoryFilter').value = '';
+        document.getElementById('dateFrom').value = '';
+        document.getElementById('dateTo').value = '';
+        uncategorizedOnly = false;
+        document.getElementById('uncatToggleBtn').textContent = 'Inbox zero: OFF';
+        document.getElementById('categoryFilter').disabled = false;
+        loadTransactions(1);
+    }
+
     function renderTable(txns) {
         const container = document.getElementById('tableBody');
 
         if (txns.length === 0) {
+            const filters = currentTransactionFilters();
+            const hasFilters = activeFilterCount(filters) > 0 || filters.uncategorizedOnly;
             container.innerHTML = `
             <div class="empty-state">
                 <div class="icon">📋</div>
-                <h3>No transactions found</h3>
-                <p>Upload transactions to get started</p>
+                <h3>${hasFilters ? 'No matching transactions' : 'No transactions found'}</h3>
+                <p>${hasFilters ? 'Try clearing filters or turning off inbox zero mode.' : 'Upload transactions to get started.'}</p>
+                ${hasFilters
+                    ? '<button class="btn btn-secondary" type="button" onclick="resetTransactionFilters()" style="margin-top:16px;">Clear filters</button>'
+                    : '<a href="/upload" class="btn btn-primary" style="margin-top:16px;">Upload Transactions</a>'}
             </div>`;
             return;
         }

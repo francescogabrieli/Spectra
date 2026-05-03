@@ -34,6 +34,15 @@ _DETAIL_ALIASES = {
     "dettagli",   # ISyBank — contains merchant name buried in a long string
     "description details", "transaction details", "detail", "additional info",
 }
+_COUNTERPART_ALIASES = {
+    "counterparty", "counterpart", "counterparty name",
+    "recipient", "recipient name",
+    "payee", "payee name",
+    "beneficiary", "beneficiary name", "beneficiario", "nome beneficiario",
+    "destinatario", "nome destinatario",
+    "ordinante", "mittente",
+    "ragione sociale", "intestatario", "nome controparte",
+}
 _AMOUNT_ALIASES = {
     "importo", "amount", "valore", "value", "ammontare",
     "importo eur", "amount eur", "saldo", "totale",
@@ -152,17 +161,19 @@ def _map_columns(headers: list[str]) -> dict[str, int]:
         h = h_raw.strip().lower()
         if h in _DATE_ALIASES:
             mapping.setdefault("date", i)
-        elif h in _DESCRIPTION_ALIASES:
+        if h in _DESCRIPTION_ALIASES:
             mapping.setdefault("description", i)
-        elif h in _DETAIL_ALIASES:
+        if h in _DETAIL_ALIASES:
             mapping.setdefault("detail", i)   # secondary detail column
-        elif h in _AMOUNT_ALIASES:
+        if h in _COUNTERPART_ALIASES:
+            mapping.setdefault("counterpart", i)
+        if h in _AMOUNT_ALIASES:
             mapping.setdefault("amount", i)
-        elif h in _CREDIT_ALIASES:
+        if h in _CREDIT_ALIASES:
             mapping.setdefault("credit", i)
-        elif h in _DEBIT_ALIASES:
+        if h in _DEBIT_ALIASES:
             mapping.setdefault("debit", i)
-        elif h in _CURRENCY_ALIASES:
+        if h in _CURRENCY_ALIASES:
             mapping.setdefault("currency", i)
 
     return mapping
@@ -223,6 +234,76 @@ def _clean_description(text: str) -> str:
             new_parts.append(part)
 
     return " | ".join(new_parts).strip(" |")
+
+
+_COUNTERPART_NOISE_RE = re.compile(
+    r"(?i)(?:"
+    r"\beffettuato(?:\s+il\s+\d{2}[/\.]\d{2}[/\.]\d{2,4})?(?:\s+alle\s+ore\s+\d{3,4})?\b|"
+    r"\bmediante\s+la\s+carta\b|"
+    r"\bora\s+autorizzazione\b|"
+    r"\bcarta(?:\s+n\.?)?\s*\d*[\*X]+[\d\*X\s]+\b|"
+    r"\bABI\s+\d+\b|"
+    r"\bCAB\s+\d+\b|"
+    r"\bATM\s+\d+\b|"
+    r"\bCOD\.?\s*\d+/?\d*\b|"
+    r"\b[A-Z0-9]{15,}\b|"
+    r"\(ctv\..*?\)|"
+    r"\b\d{2}[/.]\d{2}[/.]\d{2,4}\b|"
+    r"\b\d{4,}\b"
+    r")"
+)
+
+_COUNTERPART_CAPTURE_PATTERNS = [
+    re.compile(r"(?i)\bbonifico\s+(?:istantaneo\s+)?da\s+(?:voi\s+)?disposto\s+a\s+favore\s+di\s+(?P<value>.+)$"),
+    re.compile(r"(?i)\bbonifico\s+(?:istantaneo\s+)?a\s+vostro\s+favo(?:re)?\s+disposto\s+da\s+(?P<value>.+)$"),
+    re.compile(r"(?i)\b(?:beneficiary|beneficiario|recipient|payee|counterparty|counterpart|destinatario|ordinante|mittente)\s*[:\-]?\s+(?P<value>.+)$"),
+    re.compile(r"(?i)\bpresso\s+(?P<value>.+)$"),
+]
+
+
+def _clean_counterpart(text: str) -> str:
+    """Normalize a counterpart extracted from an explicit field or free text."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = _COUNTERPART_NOISE_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"(?i)\b(?:da\s+voi\s+disposto|a\s+vostro\s+favore\s+disposto\s+da)\b", " ", cleaned)
+    cleaned = re.sub(r"\s*\|\s*", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .|,;:-*()")
+    if not cleaned:
+        return ""
+
+    try:
+        from spectra.local_categorizer import _extract_merchant_name
+
+        return _extract_merchant_name(cleaned)
+    except Exception:
+        return cleaned.title()
+
+
+def _extract_counterpart(
+    raw_description: str,
+    detail: str = "",
+    explicit_counterpart: str = "",
+) -> str:
+    """Resolve the best available counterpart signal with clear precedence."""
+    explicit = _clean_counterpart(explicit_counterpart)
+    if explicit:
+        return explicit
+
+    for text in (str(raw_description or "").strip(), str(detail or "").strip()):
+        if not text:
+            continue
+        for pattern in _COUNTERPART_CAPTURE_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
+            candidate = _clean_counterpart(match.group("value"))
+            if candidate:
+                return candidate
+
+    return ""
 
 
 def parse_csv(
@@ -309,12 +390,24 @@ def parse_csv(
             date = _parse_date(raw_date)
 
             # Primary description + optional detail column (merged for AI context)
-            raw_desc = row[col["description"]].strip() if "description" in col else ""
+            primary_description = row[col["description"]].strip() if "description" in col else ""
+            detail = ""
             if "detail" in col and col["detail"] < len(row):
                 detail = row[col["detail"]].strip()
-                if detail and detail.lower() != raw_desc.lower():
-                    raw_desc = f"{raw_desc} | {detail}"
-            
+            explicit_counterpart = ""
+            if "counterpart" in col and col["counterpart"] < len(row):
+                explicit_counterpart = row[col["counterpart"]].strip()
+
+            counterpart = _extract_counterpart(
+                primary_description,
+                detail=detail,
+                explicit_counterpart=explicit_counterpart,
+            )
+
+            raw_desc = primary_description
+            if detail and detail.lower() != primary_description.lower():
+                raw_desc = f"{raw_desc} | {detail}"
+
             description = _clean_description(raw_desc)
 
             # Amount: either a single column or split credit/debit
@@ -346,6 +439,7 @@ def parse_csv(
                     amount=amount,
                     currency=row_currency,
                     raw_description=description,
+                    counterpart=counterpart,
                 )
             )
         except (ValueError, IndexError) as e:

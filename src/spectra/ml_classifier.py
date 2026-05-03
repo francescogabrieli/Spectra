@@ -8,14 +8,54 @@ seed data so the model progressively personalises.
 
 from __future__ import annotations
 
-import hashlib
 import logging
-from pathlib import Path
+import re
+import unicodedata
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
+from spectra.ai import CategorySuggestion
+
 logger = logging.getLogger("spectra.ml")
+
+
+@dataclass(frozen=True)
+class TrainingExample:
+    raw_description: str
+    clean_name: str
+    category: str
+    label_source: str
+    sample_weight: float
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    category: str
+    confidence: float
+    margin: float
+    suggestions: list[CategorySuggestion]
+
+
+_SEED_WEIGHT = 1.0
+_TX_HISTORY_WEIGHT = 1.0
+_MERCHANT_MEMORY_WEIGHT = 4.0
+_USER_OVERRIDE_WEIGHT = 10.0
+
+_SOURCE_WEIGHTS = {
+    "seed": _SEED_WEIGHT,
+    "tx_history": _TX_HISTORY_WEIGHT,
+    "merchant_memory": _MERCHANT_MEMORY_WEIGHT,
+    "user_override": _USER_OVERRIDE_WEIGHT,
+}
+
+_SOURCE_PRIORITIES = {
+    "seed": 0,
+    "tx_history": 1,
+    "merchant_memory": 2,
+    "user_override": 3,
+}
 
 # ── Seed knowledge ──────────────────────────────────────────────
 # Each tuple is (description_example, category).  These bootstrap the model
@@ -238,52 +278,154 @@ def build_seed_data() -> list[tuple[str, str]]:
     return data
 
 
-# Pre-computed at import time
-_SEED_DATA: list[tuple[str, str]] = build_seed_data()
+def _extract_clean_name(text: str) -> str:
+    from spectra.local_categorizer import _extract_merchant_name
 
-# Weight multiplier for user data relative to seed data
-_USER_WEIGHT = 10.0
-_SEED_WEIGHT = 1.0
+    return _extract_merchant_name(text) if text else ""
+
+
+def _normalize_feature_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text.lower()).strip()
+
+
+def _source_priority(label_source: str) -> int:
+    return _SOURCE_PRIORITIES.get(str(label_source or ""), -1)
+
+
+def _weight_for_source(label_source: str) -> float:
+    return _SOURCE_WEIGHTS.get(str(label_source or ""), _TX_HISTORY_WEIGHT)
+
+
+def _make_training_example(
+    *,
+    raw_description: str,
+    clean_name: str,
+    category: str,
+    label_source: str,
+) -> TrainingExample | None:
+    normalized_source = str(label_source or "tx_history").strip().lower()
+    normalized_category = str(category or "").strip()
+    raw = str(raw_description or "").strip()
+    merchant = str(clean_name or "").strip()
+    if raw:
+        merchant = _extract_clean_name(raw)
+    elif merchant:
+        merchant = _extract_clean_name(merchant)
+
+    if not normalized_category or not (raw or merchant):
+        return None
+
+    return TrainingExample(
+        raw_description=raw,
+        clean_name=merchant,
+        category=normalized_category,
+        label_source=normalized_source,
+        sample_weight=_weight_for_source(normalized_source),
+    )
+
+
+def _training_key(example: TrainingExample) -> str:
+    base = example.raw_description or example.clean_name
+    return _normalize_feature_text(base)
+
+
+def build_training_examples(
+    training_data: list[dict[str, str]] | list[tuple[str, str]] | None = None,
+) -> list[TrainingExample]:
+    """Resolve seed and user data into de-duplicated weighted training examples."""
+    resolved: dict[str, TrainingExample] = {}
+
+    def consider(example: TrainingExample | None) -> None:
+        if example is None:
+            return
+        key = _training_key(example)
+        if not key:
+            return
+        existing = resolved.get(key)
+        if existing is None or _source_priority(example.label_source) > _source_priority(existing.label_source):
+            resolved[key] = example
+
+    for raw_description, category in build_seed_data():
+        consider(
+            _make_training_example(
+                raw_description=raw_description,
+                clean_name="",
+                category=category,
+                label_source="seed",
+            )
+        )
+
+    for item in training_data or []:
+        if isinstance(item, tuple):
+            raw_description, category = item
+            consider(
+                _make_training_example(
+                    raw_description=str(raw_description or ""),
+                    clean_name="",
+                    category=str(category or ""),
+                    label_source="user_override",
+                )
+            )
+            continue
+
+        consider(
+            _make_training_example(
+                raw_description=str(item.get("raw_description", "")),
+                clean_name=str(item.get("clean_name", "")),
+                category=str(item.get("category", "")),
+                label_source=str(item.get("label_source", "tx_history")),
+            )
+        )
+
+    return list(resolved.values())
+
+
+def _feature_row(raw_description: str, clean_name: str) -> dict[str, str]:
+    normalized_clean_name = _normalize_feature_text(clean_name)
+    combined_text = " ".join(part for part in [raw_description.strip(), clean_name.strip()] if part).strip()
+    if not combined_text:
+        combined_text = clean_name.strip() or raw_description.strip()
+    return {
+        "combined_text": combined_text,
+        "clean_name_normalized": normalized_clean_name or _normalize_feature_text(combined_text),
+    }
+
+
+def _select_combined_text(rows: list[dict[str, str]]) -> list[str]:
+    return [row["combined_text"] for row in rows]
+
+
+def _select_clean_name_text(rows: list[dict[str, str]]) -> list[str]:
+    return [row["clean_name_normalized"] for row in rows]
 
 
 def train_classifier(
-    training_data: list[tuple[str, str]] | None = None,
+    training_data: list[dict[str, str]] | list[tuple[str, str]] | None = None,
 ) -> Any | None:
-    """Train a TF-IDF + LogisticRegression classifier.
-
-    The model is always bootstrapped with built-in seed examples so it works
-    from the very first run.  When *training_data* (from user history /
-    corrections) is provided, those samples receive a higher weight so the
-    model progressively personalises.
-
-    Returns
-    -------
-    A fitted sklearn Pipeline, or None if scikit-learn is not installed.
-    """
+    """Train a weighted TF-IDF + LogisticRegression local classifier."""
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import Pipeline
+        from sklearn.pipeline import FeatureUnion, Pipeline
+        from sklearn.preprocessing import FunctionTransformer
     except ImportError:
         logger.info("scikit-learn not installed — ML classifier disabled. Install with: pip install scikit-learn")
         return None
 
-    # Combine seed + user data
-    descriptions: list[str] = []
+    training_examples = build_training_examples(training_data)
+    feature_rows = [
+        _feature_row(example.raw_description, example.clean_name)
+        for example in training_examples
+    ]
     categories: list[str] = []
     weights: list[float] = []
-
-    for desc, cat in _SEED_DATA:
-        descriptions.append(desc)
-        categories.append(cat)
-        weights.append(_SEED_WEIGHT)
-
-    if training_data:
-        for desc, cat in training_data:
-            if desc and cat and cat != "Uncategorized":
-                descriptions.append(desc)
-                categories.append(cat)
-                weights.append(_USER_WEIGHT)
+    source_counts: dict[str, int] = {}
+    for example in training_examples:
+        categories.append(example.category)
+        weights.append(example.sample_weight)
+        source_counts[example.label_source] = source_counts.get(example.label_source, 0) + 1
 
     unique_cats = set(categories)
     if len(unique_cats) < 2:
@@ -291,13 +433,27 @@ def train_classifier(
         return None
 
     pipeline = Pipeline([
-        ("tfidf", TfidfVectorizer(
-            max_features=5000,
-            ngram_range=(1, 2),
-            sublinear_tf=True,
-            strip_accents="unicode",
-            lowercase=True,
-        )),
+        ("features", FeatureUnion([
+            ("word_tfidf", Pipeline([
+                ("selector", FunctionTransformer(_select_combined_text, validate=False)),
+                ("tfidf", TfidfVectorizer(
+                    max_features=6000,
+                    ngram_range=(1, 2),
+                    sublinear_tf=True,
+                    strip_accents="unicode",
+                    lowercase=True,
+                )),
+            ])),
+            ("char_tfidf", Pipeline([
+                ("selector", FunctionTransformer(_select_clean_name_text, validate=False)),
+                ("tfidf", TfidfVectorizer(
+                    analyzer="char_wb",
+                    ngram_range=(3, 5),
+                    sublinear_tf=True,
+                    lowercase=True,
+                )),
+            ])),
+        ])),
         ("clf", LogisticRegression(
             max_iter=1000,
             C=1.0,
@@ -305,15 +461,45 @@ def train_classifier(
         )),
     ])
 
-    pipeline.fit(descriptions, categories, clf__sample_weight=np.array(weights))
+    pipeline.fit(feature_rows, categories, clf__sample_weight=np.array(weights))
 
-    n_user = sum(1 for w in weights if w == _USER_WEIGHT)
-    n_seed = sum(1 for w in weights if w == _SEED_WEIGHT)
     logger.info(
-        "ML classifier trained: %d seed + %d user samples, %d categories",
-        n_seed, n_user, len(unique_cats),
+        "ML classifier trained: %d examples (%s), %d categories",
+        len(training_examples),
+        ", ".join(f"{source}={count}" for source, count in sorted(source_counts.items())),
+        len(unique_cats),
     )
     return pipeline
+
+
+def predict_details(
+    classifier: Any,
+    description: str,
+    *,
+    clean_name: str | None = None,
+    limit: int = 3,
+) -> PredictionResult:
+    """Predict category plus ranked suggestions for a raw bank description."""
+    resolved_clean_name = clean_name or _extract_clean_name(description)
+    feature_row = _feature_row(description, resolved_clean_name)
+    proba = classifier.predict_proba([feature_row])[0]
+    ordered = np.argsort(proba)[::-1]
+    top_indices = ordered[: max(1, limit)]
+    suggestions = [
+        CategorySuggestion(
+            category=str(classifier.classes_[idx]),
+            score=round(float(proba[idx]), 4),
+        )
+        for idx in top_indices
+    ]
+    top_confidence = suggestions[0].score
+    second_confidence = suggestions[1].score if len(suggestions) > 1 else 0.0
+    return PredictionResult(
+        category=suggestions[0].category,
+        confidence=top_confidence,
+        margin=round(top_confidence - second_confidence, 4),
+        suggestions=suggestions,
+    )
 
 
 def predict(classifier: Any, description: str) -> tuple[str, float]:
@@ -323,8 +509,5 @@ def predict(classifier: Any, description: str) -> tuple[str, float]:
     -------
     (category, confidence) — confidence is the max class probability.
     """
-    proba = classifier.predict_proba([description])[0]
-    max_idx = proba.argmax()
-    confidence = float(proba[max_idx])
-    category = classifier.classes_[max_idx]
-    return category, confidence
+    result = predict_details(classifier, description)
+    return result.category, result.confidence

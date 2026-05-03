@@ -89,6 +89,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
         for t in new_txns:
             # ParsedTransaction (from csv/pdf) uses raw_description
             od = t.raw_description
+            counterpart = str(getattr(t, "counterpart", "") or "")
             if od in overrides:
                 # We have a manual classification for this exact description
                 pre_categorised.append(
@@ -107,7 +108,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
 
             matched_rule = first_matching_rule(
                 category_rules,
-                clean_name=od,
+                clean_name=counterpart or od,
                 raw_description=od,
             )
             if matched_rule:
@@ -115,7 +116,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                     CategorisedTransaction(
                         id=t.id,
                         original_description=od,
-                        clean_name=od,
+                        clean_name=counterpart or od,
                         category=str(matched_rule["category"]),
                         amount=t.amount,
                         currency=t.currency,
@@ -138,7 +139,13 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
         categorised = []
         if to_llm:
             flat = [
-                {"raw_description": t.raw_description, "amount": t.amount, "currency": t.currency, "date": t.date}
+                {
+                    "raw_description": t.raw_description,
+                    "counterpart": getattr(t, "counterpart", ""),
+                    "amount": t.amount,
+                    "currency": t.currency,
+                    "date": t.date,
+                }
                 for t in to_llm
             ]
 
@@ -305,4 +312,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

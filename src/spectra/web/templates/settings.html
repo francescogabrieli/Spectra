@@ -2,253 +2,336 @@
 {% block title %}Settings — Spectra{% endblock %}
 
 {% block content %}
-<h1 class="page-title">Settings</h1>
-<p class="page-subtitle">Local dashboard preferences plus active environment overview</p>
-
-<div class="settings-group settings-danger-zone" id="currencySetupNotice" style="display:none;">
-    <h3>Action Required</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Set your Base Currency
-            <small>First-time setup: choose the base currency before using the app.</small>
-        </div>
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Settings</h1>
+        <p class="page-subtitle">Set up Spectra once, then keep your day-to-day preferences and automation easy to review.</p>
+    </div>
+    <div class="page-header-actions">
+        <a href="/upload" class="btn btn-secondary btn-sm">Upload</a>
+        <a href="/transactions" class="btn btn-secondary btn-sm">Transactions</a>
     </div>
 </div>
 
-<div class="settings-group">
-    <h3>Appearance</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Theme
-            <small>Auto follows your system appearance, or force Light or Dark manually</small>
-        </div>
-        <div class="settings-control-group">
-            <select class="settings-select" id="themePreference" data-theme-select>
-                <option value="auto">Auto</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-            </select>
-            <span class="settings-badge" id="themeStatus">—</span>
+<section class="settings-overview" aria-label="Settings overview">
+    <article class="settings-overview-card" id="setupStatusCard">
+        <span class="settings-overview-title">Setup status</span>
+        <strong class="settings-overview-value" id="setupStatusValue">Loading…</strong>
+        <p class="settings-overview-hint" id="setupStatusHint">Checking your current setup.</p>
+        <a class="settings-overview-link" id="setupStatusAction" href="#settings-setup">Review basics</a>
+    </article>
+    <article class="settings-overview-card">
+        <span class="settings-overview-title">Base currency</span>
+        <strong class="settings-overview-value" id="overviewCurrencyValue">—</strong>
+        <p class="settings-overview-hint" id="overviewCurrencyHint">Used across charts, budgets, and trends.</p>
+        <a class="settings-overview-link" href="#settings-currency">Edit currency</a>
+    </article>
+    <article class="settings-overview-card">
+        <span class="settings-overview-title">Financial cycle</span>
+        <strong class="settings-overview-value" id="overviewCycleValue">—</strong>
+        <p class="settings-overview-hint" id="overviewCycleHint">Used for dashboard, budgets, and trends.</p>
+        <a class="settings-overview-link" href="#settings-cycle">Edit cycle</a>
+    </article>
+    <article class="settings-overview-card">
+        <span class="settings-overview-title">Local data</span>
+        <strong class="settings-overview-value" id="overviewDataValue">—</strong>
+        <p class="settings-overview-hint" id="overviewDataHint">Loading your current library.</p>
+        <a class="settings-overview-link" href="#settings-database">View stats</a>
+    </article>
+</section>
+
+<nav class="section-nav settings-nav" aria-label="Settings sections">
+    <a class="section-nav-link" href="#settings-setup">Setup</a>
+    <a class="section-nav-link" href="#settings-automation">Automation</a>
+    <a class="section-nav-link" href="#settings-environment">Environment</a>
+    <a class="section-nav-link" href="#settings-danger">Danger zone</a>
+</nav>
+
+<section class="settings-section" id="settings-setup">
+    <div class="settings-section-head">
+        <div>
+            <div class="settings-section-eyebrow">Recommended first</div>
+            <h2>Setup & Preferences</h2>
+            <p>These defaults shape how Spectra feels every day, so they should be easy to verify at a glance.</p>
         </div>
     </div>
-</div>
 
-<div class="settings-group">
-    <h3>Financial Cycle</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Financial month starts on
-            <small>Choose a fixed day (1-28) or use the last Monday-Friday of each month.</small>
-        </div>
-        <div class="settings-control-group">
-            <select class="settings-select" id="cycleMode" onchange="updateCycleModeUI()">
-                <option value="fixed">Fixed day</option>
-                <option value="last_business_day">Last business day</option>
-            </select>
-            <div class="day-stepper" id="cycleFixedDayStepper">
-                <button class="day-stepper-btn" type="button" onclick="adjustCycleDayStep(-1)" aria-label="Decrease day">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                </button>
-                <div class="day-stepper-value">
-                    <span id="cycleStartDayNum">1</span><span class="day-stepper-ord" id="cycleStartDayOrd">st</span>
-                </div>
-                <button class="day-stepper-btn" type="button" onclick="adjustCycleDayStep(1)" aria-label="Increase day">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                </button>
+    <div class="settings-group settings-danger-zone" id="currencySetupNotice" style="display:none;">
+        <h3>Action Required</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Set your Base Currency
+                <small>First-time setup: choose the base currency before using the app.</small>
             </div>
-            <input type="hidden" id="cycleStartDay" value="1">
-            <button class="btn btn-primary btn-sm" id="saveCycleBtn" type="button" onclick="saveCyclePreference()">Save</button>
         </div>
     </div>
-    <div class="settings-row">
-        <div class="settings-label">
-            Current Cycle
-            <small>Dashboard, budget, and trends use this date range</small>
-        </div>
-        <div class="cycle-range-display" id="cyclePreview">
-            <span class="cycle-range-date" id="cycleRangeStart">—</span>
-            <svg class="cycle-range-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            <span class="cycle-range-date" id="cycleRangeEnd">—</span>
-        </div>
-    </div>
-</div>
 
-<div class="settings-group">
-    <h3>Your Custom Rules</h3>
-    <p class="page-subtitle" style="margin: -8px 0 16px;">Custom rules take priority over Spectra's automatic categorization. Spectra already works without them — add rules here to override or refine specific merchants.</p>
-    <div class="settings-row">
-        <div class="settings-label">
-            New Rule
-            <small>Match by keyword or regex, then assign a category. Applied before built-in intelligence.</small>
-        </div>
-        <div class="settings-control-group rules-builder">
-            <select id="ruleType" class="settings-select">
-                <option value="contains">Contains</option>
-                <option value="regex">Regex</option>
-            </select>
-            <input type="text" id="rulePattern" class="settings-input" placeholder="e.g. amazon|amzn|prime" />
-            <input type="text" id="ruleCategory" class="settings-input" placeholder="Category (e.g. Shopping)" list="categoryHints" />
-            <datalist id="categoryHints"></datalist>
-            <button class="btn btn-primary btn-sm" type="button" onclick="createRule()">Add rule</button>
-        </div>
-    </div>
-    <div class="settings-row">
-        <div class="settings-label">
-            Rules Summary
-            <small>Toggle active status, change priority, and preview historical impact before saving.</small>
-        </div>
-        <div class="settings-control-group">
-            <span class="settings-badge" id="rulesSummaryBadge">—</span>
+    <div class="settings-group" id="settings-currency">
+        <h3>Currency</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Base Currency
+                <small>All amounts are normalized to this currency using ECB rates.</small>
+            </div>
+            <div class="settings-control-group">
+                <select class="settings-select" id="baseCurrencySelect">
+                    <option value="EUR">EUR</option>
+                    <option value="USD">USD</option>
+                    <option value="GBP">GBP</option>
+                    <option value="CHF">CHF</option>
+                    <option value="JPY">JPY</option>
+                    <option value="CAD">CAD</option>
+                    <option value="AUD">AUD</option>
+                    <option value="SEK">SEK</option>
+                    <option value="NOK">NOK</option>
+                    <option value="DKK">DKK</option>
+                </select>
+                <button class="btn btn-primary btn-sm" id="saveCurrencyBtn" type="button" onclick="saveBaseCurrency()">Save</button>
+                <span class="settings-badge" id="currencySetupBadge" style="display:none;">Required</span>
+            </div>
         </div>
     </div>
-    <div class="settings-inline-panel">
-        <div class="settings-inline-panel-header">Test current builder</div>
-        <div class="settings-control-group rules-builder" style="margin-top:0;">
-            <input type="text" id="ruleSampleText" class="settings-input" placeholder="Sample transaction text to test" />
-            <button class="btn btn-secondary btn-sm" type="button" onclick="testRule()">Test rule</button>
-        </div>
-        <div class="table-cell-muted" id="ruleTestResult">Add a rule or sample text to preview its impact.</div>
-    </div>
-    <div id="rulesList" class="rules-list">
-        <div class="empty-state" style="padding: 18px; margin-top: 8px;">
-            <p>Loading rules...</p>
-        </div>
-    </div>
-</div>
 
-<div class="settings-group">
-    <h3>Learning Center</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Feedback Loop
-            <small>Recent manual corrections are stored here. Re-apply them to historical data when rules or overrides evolve.</small>
-        </div>
-        <div class="settings-control-group">
-            <button class="btn btn-secondary btn-sm" type="button" onclick="reapplyLearning()">Reapply to history</button>
-        </div>
-    </div>
-    <div class="settings-stats-grid">
-        <div class="settings-stat-card">
-            <span class="settings-stat-label">Feedback events</span>
-            <strong id="feedbackCount">—</strong>
-        </div>
-        <div class="settings-stat-card">
-            <span class="settings-stat-label">Future-learning events</span>
-            <strong id="futureLearningCount">—</strong>
-        </div>
-        <div class="settings-stat-card">
-            <span class="settings-stat-label">Overrides</span>
-            <strong id="overrideCount">—</strong>
-        </div>
-        <div class="settings-stat-card">
-            <span class="settings-stat-label">Uncategorized left</span>
-            <strong id="learningUncategorizedCount">—</strong>
+    <div class="settings-group" id="settings-appearance">
+        <h3>Appearance</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Theme
+                <small>Auto follows your system appearance, or force Light or Dark manually.</small>
+            </div>
+            <div class="settings-control-group">
+                <select class="settings-select" id="themePreference" data-theme-select>
+                    <option value="auto">Auto</option>
+                    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                </select>
+                <span class="settings-badge" id="themeStatus">—</span>
+            </div>
         </div>
     </div>
-    <div id="learningList" class="rules-list">
-        <div class="empty-state" style="padding: 18px; margin-top: 8px;">
-            <p>Loading learning events...</p>
-        </div>
-    </div>
-</div>
 
-<div class="settings-group">
-    <h3>AI Provider</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Categorization Engine
-            <small>Set AI_PROVIDER in .env (local, openai, or gemini)</small>
+    <div class="settings-group" id="settings-cycle">
+        <h3>Financial Cycle</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Financial month starts on
+                <small>Choose a fixed day (1-28) or use the last Monday-Friday of each month.</small>
+            </div>
+            <div class="settings-control-group">
+                <select class="settings-select" id="cycleMode" onchange="updateCycleModeUI()">
+                    <option value="fixed">Fixed day</option>
+                    <option value="last_business_day">Last business day</option>
+                </select>
+                <div class="day-stepper" id="cycleFixedDayStepper">
+                    <button class="day-stepper-btn" type="button" onclick="adjustCycleDayStep(-1)" aria-label="Decrease day">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    </button>
+                    <div class="day-stepper-value">
+                        <span id="cycleStartDayNum">1</span><span class="day-stepper-ord" id="cycleStartDayOrd">st</span>
+                    </div>
+                    <button class="day-stepper-btn" type="button" onclick="adjustCycleDayStep(1)" aria-label="Increase day">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    </button>
+                </div>
+                <input type="hidden" id="cycleStartDay" value="1">
+                <button class="btn btn-primary btn-sm" id="saveCycleBtn" type="button" onclick="saveCyclePreference()">Save</button>
+            </div>
         </div>
-        <span class="settings-badge" id="provider">—</span>
-    </div>
-    <div class="settings-row">
-        <div class="settings-label">
-            Google Sheets
-            <small>Auto-sync transactions when SPREADSHEET_ID is configured</small>
+        <div class="settings-row">
+            <div class="settings-label">
+                Current Cycle
+                <small>Dashboard, budget, and trends use this date range.</small>
+            </div>
+            <div class="cycle-range-display" id="cyclePreview">
+                <span class="cycle-range-date" id="cycleRangeStart">—</span>
+                <svg class="cycle-range-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                <span class="cycle-range-date" id="cycleRangeEnd">—</span>
+            </div>
         </div>
-        <span class="settings-badge" id="sheetsStatus">—</span>
     </div>
-</div>
+</section>
 
-<div class="settings-group">
-    <h3>Currency</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Base Currency
-            <small>All amounts converted to this currency via ECB rates</small>
-        </div>
-        <div class="settings-control-group">
-            <select class="settings-select" id="baseCurrencySelect">
-                <option value="EUR">EUR</option>
-                <option value="USD">USD</option>
-                <option value="GBP">GBP</option>
-                <option value="CHF">CHF</option>
-                <option value="JPY">JPY</option>
-                <option value="CAD">CAD</option>
-                <option value="AUD">AUD</option>
-                <option value="SEK">SEK</option>
-                <option value="NOK">NOK</option>
-                <option value="DKK">DKK</option>
-            </select>
-            <button class="btn btn-primary btn-sm" id="saveCurrencyBtn" type="button" onclick="saveBaseCurrency()">Save</button>
-            <span class="settings-badge" id="currencySetupBadge" style="display:none;">Required</span>
+<section class="settings-section" id="settings-automation">
+    <div class="settings-section-head">
+        <div>
+            <div class="settings-section-eyebrow">Power features</div>
+            <h2>Automation & Learning</h2>
+            <p>Use these when you want Spectra to get smarter over time without losing control of individual decisions.</p>
         </div>
     </div>
-</div>
 
-<div class="settings-group">
-    <h3>Database</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Transactions
-            <small>Total stored in local SQLite database</small>
+    <div class="settings-group">
+        <h3>Your Custom Rules</h3>
+        <p class="settings-group-copy">Custom rules take priority over Spectra's automatic categorization. Spectra already works without them, so use rules only when you want a deterministic override.</p>
+        <div class="settings-row">
+            <div class="settings-label">
+                New Rule
+                <small>Match by keyword or regex, then assign a category before built-in intelligence runs.</small>
+            </div>
+            <div class="settings-control-group rules-builder">
+                <select id="ruleType" class="settings-select">
+                    <option value="contains">Contains</option>
+                    <option value="regex">Regex</option>
+                </select>
+                <input type="text" id="rulePattern" class="settings-input" placeholder="e.g. amazon|amzn|prime" />
+                <input type="text" id="ruleCategory" class="settings-input" placeholder="Category (e.g. Shopping)" list="categoryHints" />
+                <datalist id="categoryHints"></datalist>
+                <button class="btn btn-primary btn-sm" type="button" onclick="createRule()">Add rule</button>
+            </div>
         </div>
-        <div class="settings-value" id="txCount">—</div>
-    </div>
-    <div class="settings-row">
-        <div class="settings-label">
-            Known Merchants
-            <small>Merchants with learned categories</small>
+        <div class="settings-row">
+            <div class="settings-label">
+                Rules Summary
+                <small>Toggle active status, change priority, and preview historical impact before saving.</small>
+            </div>
+            <div class="settings-control-group">
+                <span class="settings-badge" id="rulesSummaryBadge">—</span>
+            </div>
         </div>
-        <div class="settings-value" id="merchantCount">—</div>
-    </div>
-    <div class="settings-row">
-        <div class="settings-label">
-            Categories
-            <small>Distinct categories in use</small>
+        <div class="settings-inline-panel">
+            <div class="settings-inline-panel-header">Test current builder</div>
+            <div class="settings-control-group rules-builder" style="margin-top:0;">
+                <input type="text" id="ruleSampleText" class="settings-input" placeholder="Sample transaction text to test" />
+                <button class="btn btn-secondary btn-sm" type="button" onclick="testRule()">Test rule</button>
+            </div>
+            <div class="table-cell-muted" id="ruleTestResult">Add a rule or sample text to preview its impact.</div>
         </div>
-        <div class="settings-value" id="categoryCount">—</div>
-    </div>
-    <div class="settings-row">
-        <div class="settings-label">
-            Active Rules
-            <small>Rules currently active in the deterministic engine</small>
+        <div id="rulesList" class="rules-list">
+            <div class="empty-state" style="padding: 18px; margin-top: 8px;">
+                <p>Loading rules...</p>
+            </div>
         </div>
-        <div class="settings-value" id="activeRuleCount">—</div>
     </div>
-</div>
 
-<div class="settings-group">
-    <h3>Export</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Download Transactions
-            <small>Export all transactions as a CSV file</small>
+    <div class="settings-group">
+        <h3>Learning Center</h3>
+        <p class="settings-group-copy">Recent manual corrections are stored here. Re-apply them to historical data when rules or overrides evolve.</p>
+        <div class="settings-row">
+            <div class="settings-label">
+                Feedback Loop
+                <small>Use this when you want Spectra to re-run your current knowledge against existing history.</small>
+            </div>
+            <div class="settings-control-group">
+                <button class="btn btn-secondary btn-sm" type="button" onclick="reapplyLearning()">Reapply to history</button>
+            </div>
         </div>
-        <button class="btn btn-secondary" onclick="exportCSV()">📥 Download CSV</button>
+        <div class="settings-stats-grid">
+            <div class="settings-stat-card">
+                <span class="settings-stat-label">Feedback events</span>
+                <strong id="feedbackCount">—</strong>
+            </div>
+            <div class="settings-stat-card">
+                <span class="settings-stat-label">Future-learning events</span>
+                <strong id="futureLearningCount">—</strong>
+            </div>
+            <div class="settings-stat-card">
+                <span class="settings-stat-label">Overrides</span>
+                <strong id="overrideCount">—</strong>
+            </div>
+            <div class="settings-stat-card">
+                <span class="settings-stat-label">Uncategorized left</span>
+                <strong id="learningUncategorizedCount">—</strong>
+            </div>
+        </div>
+        <div id="learningList" class="rules-list">
+            <div class="empty-state" style="padding: 18px; margin-top: 8px;">
+                <p>Loading learning events...</p>
+            </div>
+        </div>
     </div>
-</div>
+</section>
 
-<div class="settings-group settings-danger-zone">
-    <h3>Danger Zone</h3>
-    <div class="settings-row">
-        <div class="settings-label">
-            Reset Local Database
-            <small>Deletes transactions, dedup history, merchant mappings, overrides, and budgets</small>
+<section class="settings-section" id="settings-environment">
+    <div class="settings-section-head">
+        <div>
+            <div class="settings-section-eyebrow">Read-only context</div>
+            <h2>Environment & Data</h2>
+            <p>These sections help you understand the current runtime, what is connected, and what is stored locally.</p>
         </div>
-        <button class="btn btn-danger" id="resetDbBtn" onclick="resetDatabase()">🗑 Reset DB</button>
     </div>
-</div>
+
+    <div class="settings-group">
+        <h3>AI Provider</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Categorization Engine
+                <small>Controlled by <code>AI_PROVIDER</code> in your environment (`local`, `openai`, or `gemini`).</small>
+            </div>
+            <span class="settings-badge" id="provider">—</span>
+        </div>
+        <div class="settings-row">
+            <div class="settings-label">
+                Google Sheets
+                <small>Auto-sync transactions when <code>SPREADSHEET_ID</code> is configured.</small>
+            </div>
+            <span class="settings-badge" id="sheetsStatus">—</span>
+        </div>
+    </div>
+
+    <div class="settings-group" id="settings-database">
+        <h3>Database</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Transactions
+                <small>Total stored in the local SQLite database.</small>
+            </div>
+            <div class="settings-value" id="txCount">—</div>
+        </div>
+        <div class="settings-row">
+            <div class="settings-label">
+                Known Merchants
+                <small>Merchants with learned categories.</small>
+            </div>
+            <div class="settings-value" id="merchantCount">—</div>
+        </div>
+        <div class="settings-row">
+            <div class="settings-label">
+                Categories
+                <small>Distinct categories currently in use.</small>
+            </div>
+            <div class="settings-value" id="categoryCount">—</div>
+        </div>
+        <div class="settings-row">
+            <div class="settings-label">
+                Active Rules
+                <small>Rules currently active in the deterministic engine.</small>
+            </div>
+            <div class="settings-value" id="activeRuleCount">—</div>
+        </div>
+    </div>
+
+    <div class="settings-group">
+        <h3>Export</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Download Transactions
+                <small>Export all transactions as a CSV file.</small>
+            </div>
+            <button class="btn btn-secondary" onclick="exportCSV()">Download CSV</button>
+        </div>
+    </div>
+</section>
+
+<section class="settings-section" id="settings-danger">
+    <div class="settings-section-head">
+        <div>
+            <div class="settings-section-eyebrow">Advanced</div>
+            <h2>Danger Zone</h2>
+            <p>Destructive actions stay here so they are still available, but clearly separated from normal preferences.</p>
+        </div>
+    </div>
+
+    <div class="settings-group settings-danger-zone">
+        <h3>Danger Zone</h3>
+        <div class="settings-row">
+            <div class="settings-label">
+                Reset Local Database
+                <small>Deletes transactions, dedup history, merchant mappings, overrides, and budgets.</small>
+            </div>
+            <button class="btn btn-danger" id="resetDbBtn" onclick="resetDatabase()">Reset DB</button>
+        </div>
+    </div>
+</section>
 {% endblock %}
 
 {% block scripts %}
@@ -271,6 +354,71 @@
             case 2: return 'nd';
             case 3: return 'rd';
             default: return 'th';
+        }
+    }
+
+    function formatCycleOverview(settings) {
+        if ((settings.cycle_mode || 'fixed') === 'last_business_day') {
+            return 'Last business day';
+        }
+        const day = settings.fixed_cycle_start_day || settings.cycle_start_day || settings.pay_day || 1;
+        return `Fixed day · ${day}${ordSuffix(day)}`;
+    }
+
+    function updateSettingsOverview(settings) {
+        const requiresCurrencySetup = Boolean(settings.requires_base_currency_setup);
+        const setupCard = document.getElementById('setupStatusCard');
+        const setupValue = document.getElementById('setupStatusValue');
+        const setupHint = document.getElementById('setupStatusHint');
+        const setupAction = document.getElementById('setupStatusAction');
+        const currencyValue = document.getElementById('overviewCurrencyValue');
+        const currencyHint = document.getElementById('overviewCurrencyHint');
+        const cycleValue = document.getElementById('overviewCycleValue');
+        const cycleHint = document.getElementById('overviewCycleHint');
+        const dataValue = document.getElementById('overviewDataValue');
+        const dataHint = document.getElementById('overviewDataHint');
+
+        if (setupCard) {
+            setupCard.classList.toggle('is-warning', requiresCurrencySetup);
+        }
+        if (setupValue) {
+            setupValue.textContent = requiresCurrencySetup ? 'Action required' : 'Ready';
+        }
+        if (setupHint) {
+            setupHint.textContent = requiresCurrencySetup
+                ? 'Choose a base currency before using Spectra normally.'
+                : 'Core preferences are configured and ready to use.';
+        }
+        if (setupAction) {
+            setupAction.textContent = requiresCurrencySetup ? 'Choose base currency' : 'Review basics';
+            setupAction.setAttribute('href', requiresCurrencySetup ? '#settings-currency' : '#settings-setup');
+        }
+
+        if (currencyValue) {
+            currencyValue.textContent = String(settings.currency || '—').toUpperCase();
+        }
+        if (currencyHint) {
+            currencyHint.textContent = requiresCurrencySetup
+                ? 'Required before the first real workflow.'
+                : 'Used across charts, budgets, and trends.';
+        }
+
+        if (cycleValue) {
+            cycleValue.textContent = formatCycleOverview(settings);
+        }
+        if (cycleHint) {
+            cycleHint.textContent = settings.current_cycle?.label
+                ? `Current cycle: ${settings.current_cycle.label}`
+                : 'Used for dashboard, budgets, and trends.';
+        }
+
+        if (dataValue) {
+            dataValue.textContent = `${Number(settings.tx_count || 0).toLocaleString()} tx`;
+        }
+        if (dataHint) {
+            const merchantCount = Number(settings.merchant_count || 0).toLocaleString();
+            const feedbackCount = Number(settings.feedback_count || 0).toLocaleString();
+            dataHint.textContent = `${merchantCount} learned merchants · ${feedbackCount} feedback events`;
         }
     }
 
@@ -722,16 +870,17 @@
                 updateThemePreferenceUI(state);
             }
             updateCycleUI(s);
+            updateSettingsOverview(s);
 
             // Provider badge
             const provEl = document.getElementById('provider');
-            const provLabels = { local: '🔒 Local (Offline)', openai: '🤖 OpenAI', gemini: '✨ Gemini' };
+            const provLabels = { local: 'Local · offline', openai: 'OpenAI', gemini: 'Gemini' };
             provEl.textContent = provLabels[s.provider] || s.provider;
             provEl.className = `settings-badge ${s.provider === 'local' ? 'local' : 'cloud'}`;
 
             // Sheets status
             const sheetsEl = document.getElementById('sheetsStatus');
-            sheetsEl.textContent = s.sheets_connected ? '✅ Connected' : '⚪ Not configured';
+            sheetsEl.textContent = s.sheets_connected ? 'Connected' : 'Not configured';
             sheetsEl.className = `settings-badge ${s.sheets_connected ? 'local' : ''}`;
 
             // Currency

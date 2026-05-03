@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -163,8 +163,18 @@ class TestCategoriseLocal:
         from spectra.ml_classifier import train_classifier
         return train_classifier()
 
-    def _make_txn(self, desc: str, amount: float = -10.0, currency: str = "EUR", date: str = "2026-02-01"):
-        return {"raw_description": desc, "amount": amount, "currency": currency, "date": date}
+    def _make_txn(
+        self,
+        desc: str,
+        amount: float = -10.0,
+        currency: str = "EUR",
+        date: str = "2026-02-01",
+        counterpart: str = "",
+    ):
+        payload = {"raw_description": desc, "amount": amount, "currency": currency, "date": date}
+        if counterpart:
+            payload["counterpart"] = counterpart
+        return payload
 
     def test_exact_merchant_memory_hit(self):
         """When a merchant is in the DB, it should be used directly."""
@@ -179,6 +189,18 @@ class TestCategoriseLocal:
         txns = [self._make_txn("SPOTIFY AB")]
         results = categorise_local(txns, merchant_db={}, ml_classifier=self._get_ml())
         assert len(results) == 1
+        assert results[0].category == "Digital Subscriptions"
+
+    def test_counterpart_is_used_as_preferred_signal(self):
+        """An extracted counterpart should override a generic raw description."""
+        merchant_db = {"Porkbun.Com Sherwood": "Digital Subscriptions"}
+        txns = [self._make_txn(
+            "Pagamento Effettuato Su Pos Estero",
+            counterpart="Porkbun.Com Sherwood",
+        )]
+        results = categorise_local(txns, merchant_db=merchant_db, ml_classifier=self._get_ml())
+        assert len(results) == 1
+        assert results[0].clean_name == "Porkbun.Com Sherwood"
         assert results[0].category == "Digital Subscriptions"
 
     def test_fallback_to_uncategorized(self):
@@ -240,6 +262,8 @@ class TestCategoriseLocal:
         results = categorise_local(txns, merchant_db={}, ml_classifier=None)
         assert len(results) == 1
         assert results[0].category == "Uncategorized"
+        assert results[0].classification_source == "fallback"
+        assert results[0].needs_review is True
 
 
 class TestAdaptiveThresholdAndHybridFallback:
@@ -261,7 +285,20 @@ class TestAdaptiveThresholdAndHybridFallback:
     def test_low_confidence_shopping_rejected(self, monkeypatch: pytest.MonkeyPatch):
         from spectra import ml_classifier
 
-        monkeypatch.setattr(ml_classifier, "predict", lambda _clf, _desc: ("Shopping", 0.24))
+        monkeypatch.setattr(
+            ml_classifier,
+            "predict_details",
+            lambda _clf, _desc, clean_name=None: SimpleNamespace(
+                category="Shopping",
+                confidence=0.24,
+                margin=0.04,
+                suggestions=[
+                    {"category": "Shopping", "score": 0.24},
+                    {"category": "Groceries", "score": 0.20},
+                    {"category": "Food & Dining", "score": 0.18},
+                ],
+            ),
+        )
         results = categorise_local(
             [self._txn("CARD PAYMENT RANDOM STORE")],
             merchant_db={},
@@ -269,11 +306,27 @@ class TestAdaptiveThresholdAndHybridFallback:
         )
         assert len(results) == 1
         assert results[0].category == "Uncategorized"
+        assert results[0].classification_source == "fallback"
+        assert results[0].needs_review is True
+        assert len(results[0].category_suggestions) == 3
 
     def test_low_confidence_ml_can_fallback_to_salary(self, monkeypatch: pytest.MonkeyPatch):
         from spectra import ml_classifier
 
-        monkeypatch.setattr(ml_classifier, "predict", lambda _clf, _desc: ("Shopping", 0.18))
+        monkeypatch.setattr(
+            ml_classifier,
+            "predict_details",
+            lambda _clf, _desc, clean_name=None: SimpleNamespace(
+                category="Shopping",
+                confidence=0.18,
+                margin=0.03,
+                suggestions=[
+                    {"category": "Shopping", "score": 0.18},
+                    {"category": "Salary", "score": 0.17},
+                    {"category": "Transfer In", "score": 0.16},
+                ],
+            ),
+        )
         results = categorise_local(
             [self._txn("STIPENDIO MARZO ACME SRL", amount=2400.00)],
             merchant_db={},
@@ -281,11 +334,26 @@ class TestAdaptiveThresholdAndHybridFallback:
         )
         assert len(results) == 1
         assert results[0].category == "Salary"
+        assert results[0].classification_source == "hybrid"
+        assert results[0].needs_review is True
 
     def test_low_confidence_ml_can_fallback_to_transfer_in(self, monkeypatch: pytest.MonkeyPatch):
         from spectra import ml_classifier
 
-        monkeypatch.setattr(ml_classifier, "predict", lambda _clf, _desc: ("Shopping", 0.15))
+        monkeypatch.setattr(
+            ml_classifier,
+            "predict_details",
+            lambda _clf, _desc, clean_name=None: SimpleNamespace(
+                category="Shopping",
+                confidence=0.15,
+                margin=0.02,
+                suggestions=[
+                    {"category": "Shopping", "score": 0.15},
+                    {"category": "Transfer In", "score": 0.14},
+                    {"category": "Salary", "score": 0.13},
+                ],
+            ),
+        )
         results = categorise_local(
             [self._txn("BONIFICO RICEVUTO DA MARIO ROSSI", amount=120.00)],
             merchant_db={},
@@ -293,6 +361,8 @@ class TestAdaptiveThresholdAndHybridFallback:
         )
         assert len(results) == 1
         assert results[0].category == "Transfer In"
+        assert results[0].classification_source == "hybrid"
+        assert results[0].needs_review is True
 
     def test_fallback_works_even_without_ml(self):
         results = categorise_local(
@@ -302,3 +372,18 @@ class TestAdaptiveThresholdAndHybridFallback:
         )
         assert len(results) == 1
         assert results[0].category == "Utilities"
+        assert results[0].classification_source == "hybrid"
+        assert results[0].needs_review is True
+
+    def test_confident_ml_prediction_is_not_marked_for_review(self):
+        from spectra.ml_classifier import train_classifier
+
+        results = categorise_local(
+            [self._txn("NETFLIX.COM", amount=-14.99)],
+            merchant_db={},
+            ml_classifier=train_classifier(),
+        )
+        assert len(results) == 1
+        assert results[0].category == "Digital Subscriptions"
+        assert results[0].classification_source in {"ml", "exact", "fuzzy"}
+        assert results[0].needs_review is False

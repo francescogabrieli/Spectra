@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any
 
-from spectra.ai import CategorisedTransaction
+from spectra.ai import CategorySuggestion, CategorisedTransaction
 
 logger = logging.getLogger("spectra.local")
 
@@ -14,6 +14,7 @@ logger = logging.getLogger("spectra.local")
 # ── Adaptive ML confidence thresholds ───────────────────────────
 
 _DEFAULT_ML_THRESHOLD = 0.20
+_DEFAULT_ML_MARGIN = 0.08
 _CATEGORY_ML_THRESHOLDS: dict[str, float] = {
     # Ambiguous high-volume spend classes use a stricter threshold
     "Shopping": 0.30,
@@ -39,9 +40,36 @@ _CATEGORY_ML_THRESHOLDS: dict[str, float] = {
     "Pension": 0.16,
 }
 
+_CATEGORY_ML_MARGINS: dict[str, float] = {
+    "Shopping": 0.12,
+    "Groceries": 0.10,
+    "Food & Dining": 0.10,
+    "Entertainment": 0.10,
+    "Transport": 0.09,
+    "Travel": 0.09,
+    "Utilities": 0.08,
+    "Health": 0.08,
+    "Education": 0.08,
+    "Health & Fitness": 0.08,
+    "Digital Subscriptions": 0.07,
+    "Insurance": 0.07,
+    "Taxes": 0.07,
+    "Transfer": 0.06,
+    "Transfer In": 0.06,
+    "Reimbursement": 0.06,
+    "Cash Withdrawal": 0.06,
+    "Cash Deposit": 0.06,
+    "Salary": 0.05,
+    "Pension": 0.05,
+}
+
 
 def _ml_threshold_for_category(category: str) -> float:
     return _CATEGORY_ML_THRESHOLDS.get(category, _DEFAULT_ML_THRESHOLD)
+
+
+def _ml_margin_for_category(category: str) -> float:
+    return _CATEGORY_ML_MARGINS.get(category, _DEFAULT_ML_MARGIN)
 
 
 # ── Hybrid fallback (keyword / regex) ───────────────────────────
@@ -249,6 +277,7 @@ def categorise_local(
     ----------
     transactions:
         List of dicts with keys: raw_description, amount, currency, date
+        and optional counterpart
     merchant_db:
         Dict of {clean_name: category} from the local DB.
     ml_classifier:
@@ -274,17 +303,24 @@ def categorise_local(
         amount = float(t.get("amount", 0))
         currency = t.get("currency", "EUR")
         date = t.get("date", "")
+        counterpart = str(t.get("counterpart", "") or "").strip()
 
         # Generate ID
         raw_id = f"{date}:{raw}:{amount}"
         txn_id = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()
 
         # Step 1: Extract clean merchant name
-        clean_name = _extract_merchant_name(raw)
+        clean_name = counterpart or _extract_merchant_name(raw)
+        classification_source = ""
+        category_confidence: float | None = None
+        category_suggestions: list[CategorySuggestion] = []
+        needs_review = False
 
         # Step 2: Exact merchant memory
         if clean_name in merchant_db:
             category = merchant_db[clean_name]
+            classification_source = "exact"
+            category_confidence = 1.0
             stats["exact"] += 1
             logger.debug("Exact match: %r → %s", clean_name, category)
 
@@ -292,54 +328,75 @@ def categorise_local(
         elif (fuzzy_result := _fuzzy_match(clean_name, merchant_db)):
             matched_name, category = fuzzy_result
             clean_name = matched_name  # Use the canonical name
+            classification_source = "fuzzy"
             stats["fuzzy"] += 1
 
         # Step 4: ML classifier (always active thanks to seed data)
         elif ml_classifier is not None:
             try:
-                from spectra.ml_classifier import predict
-                pred_cat, confidence = predict(ml_classifier, raw)
+                from spectra.ml_classifier import predict_details
+
+                prediction = predict_details(ml_classifier, raw, clean_name=clean_name)
+                pred_cat = prediction.category
+                confidence = prediction.confidence
+                margin = prediction.margin
                 min_confidence = _ml_threshold_for_category(pred_cat)
-                if confidence >= min_confidence:
+                min_margin = _ml_margin_for_category(pred_cat)
+                category_confidence = confidence
+                category_suggestions = list(prediction.suggestions[:3])
+                if confidence >= min_confidence and margin >= min_margin:
                     category = pred_cat
+                    classification_source = "ml"
                     stats["ml"] += 1
                     logger.debug(
-                        "ML: %r → %s (%.0f%%, threshold=%.0f%%)",
-                        raw[:50], category, confidence * 100, min_confidence * 100,
+                        "ML: %r → %s (%.0f%%, threshold=%.0f%%, margin=%.0f%%, min_margin=%.0f%%)",
+                        raw[:50], category, confidence * 100, min_confidence * 100, margin * 100, min_margin * 100,
                     )
                 else:
                     fallback_cat = _hybrid_keyword_fallback(raw, clean_name, amount)
                     if fallback_cat:
                         category = fallback_cat
+                        classification_source = "hybrid"
+                        needs_review = True
                         stats["hybrid"] += 1
                         logger.debug(
-                            "Hybrid fallback: %r → %s (ML %.0f%% < %.0f%%)",
-                            raw[:50], category, confidence * 100, min_confidence * 100,
+                            "Hybrid fallback: %r → %s (ML %.0f%% / %.0f%%, margin %.0f%% / %.0f%%)",
+                            raw[:50], category, confidence * 100, min_confidence * 100, margin * 100, min_margin * 100,
                         )
                     else:
                         category = "Uncategorized"
+                        classification_source = "fallback"
+                        needs_review = True
                         stats["fallback"] += 1
                         logger.debug(
-                            "ML low confidence for %r (%.0f%% < %.0f%%) → Uncategorized",
-                            raw[:50], confidence * 100, min_confidence * 100,
+                            "ML low confidence for %r (%.0f%% / %.0f%%, margin %.0f%% / %.0f%%) → Uncategorized",
+                            raw[:50], confidence * 100, min_confidence * 100, margin * 100, min_margin * 100,
                         )
             except Exception:
                 fallback_cat = _hybrid_keyword_fallback(raw, clean_name, amount)
                 if fallback_cat:
                     category = fallback_cat
+                    classification_source = "hybrid"
+                    needs_review = True
                     stats["hybrid"] += 1
                 else:
                     category = "Uncategorized"
+                    classification_source = "fallback"
+                    needs_review = True
                     stats["fallback"] += 1
 
         # Step 5: Hybrid fallback (when ML is unavailable)
         elif (fallback_cat := _hybrid_keyword_fallback(raw, clean_name, amount)):
             category = fallback_cat
+            classification_source = "hybrid"
+            needs_review = True
             stats["hybrid"] += 1
 
         # Step 6: Fallback
         else:
             category = "Uncategorized"
+            classification_source = "fallback"
+            needs_review = True
             stats["fallback"] += 1
 
         # Income override: positive amounts not already categorised as income/transfer
@@ -350,6 +407,10 @@ def categorise_local(
         }
         if amount > 0 and category not in _INCOME_CATS and category != "Uncategorized":
             category = "Other Income"
+            category_confidence = None
+            category_suggestions = []
+            if not classification_source:
+                classification_source = "hybrid"
 
         recurring = ""
         results.append(
@@ -364,6 +425,10 @@ def categorise_local(
                 recurring=recurring,
                 original_amount=None,
                 original_currency=None,
+                classification_source=classification_source,
+                category_confidence=category_confidence,
+                category_suggestions=category_suggestions,
+                needs_review=needs_review,
             )
         )
 

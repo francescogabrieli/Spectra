@@ -149,6 +149,8 @@ spectra.cmd start -Port 3000 -Build
 
 #### Daily startup (after first build)
 
+`start` now auto-updates the repo when Spectra was cloned with Git, the working tree is clean, and the update can be applied as a fast-forward. When that happens, the Docker image is rebuilt automatically. Use `--no-update` to skip this behavior.
+
 macOS/Linux:
 ```bash
 ./spectra start
@@ -162,6 +164,17 @@ Windows PowerShell:
 Windows CMD:
 ```cmd
 spectra.cmd start
+```
+
+Skip auto-update:
+```bash
+./spectra start --no-update
+```
+```powershell
+.\spectra.ps1 start -NoUpdate
+```
+```cmd
+spectra.cmd start -NoUpdate
 ```
 
 #### Stop / Logs / Status
@@ -294,9 +307,6 @@ To let Spectra write to your Google Sheet, you need a Google Cloud **Service Acc
 * **Local-first pipeline**: parsing, normalization, deduplication, and (with `local`) categorization run locally
 * **SQLite storage**: local database stored in `data/prism.db` by default — you can reset it anytime from the Settings page
 * **Cloud providers**: when using `openai`/`gemini`, Spectra sends a minimal payload (date + cleaned description + amount)
-
----
-
 ## License
 
 **GNU Affero General Public License v3.0 (AGPL-3.0)**

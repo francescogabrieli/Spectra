@@ -2,8 +2,40 @@
 {% block title %}Upload — Spectra{% endblock %}
 
 {% block content %}
-<h1 class="page-title">Upload</h1>
-<p class="page-subtitle">Drag and drop a CSV, PDF, or OFX bank export, then review merchants and categories before saving</p>
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Upload</h1>
+        <p class="page-subtitle">Import a CSV, PDF, or OFX export, review the suggestions, then save only what looks right.</p>
+    </div>
+    <div class="page-header-actions">
+        <a href="/transactions" class="btn btn-secondary btn-sm">Transactions</a>
+        <a href="/settings" class="btn btn-secondary btn-sm">Settings</a>
+    </div>
+</div>
+
+<section class="workflow-steps" aria-label="Upload workflow">
+    <article class="workflow-step">
+        <span class="workflow-step-number">1</span>
+        <div>
+            <h3>Drop a file</h3>
+            <p>CSV, PDF, or OFX exports all work here.</p>
+        </div>
+    </article>
+    <article class="workflow-step">
+        <span class="workflow-step-number">2</span>
+        <div>
+            <h3>Review suggestions</h3>
+            <p>Fix merchants and categories before they enter your history.</p>
+        </div>
+    </article>
+    <article class="workflow-step">
+        <span class="workflow-step-number">3</span>
+        <div>
+            <h3>Save with confidence</h3>
+            <p>Teach Spectra while you save, so the next import needs less work.</p>
+        </div>
+    </article>
+</section>
 
 <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
@@ -18,7 +50,7 @@
 </div>
 
 <!-- Real progress UI (hidden until upload starts) -->
-<div id="processing" style="display:none; padding:40px 0; max-width:480px; margin:0 auto;">
+<div id="processing" class="processing-inline-card" style="display:none;">
     <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
         <span id="stepLabel" style="font-size:13px; font-weight:500; color:var(--text-muted);">Uploading...</span>
         <span id="pctLabel"
@@ -32,9 +64,16 @@
 </div>
 
 <div class="preview-section" id="previewSection">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-        <h2 style="font-size:18px; font-weight:600;" id="previewTitle">Preview</h2>
-        <div style="display:flex; gap:8px;">
+    <div class="preview-toolbar">
+        <div>
+            <h2 style="font-size:18px; font-weight:600;" id="previewTitle">Review before import</h2>
+            <div class="preview-meta" id="previewMeta">
+                <span class="settings-badge local" id="previewCountBadge">0 rows</span>
+                <span class="settings-badge warning" id="previewNeedsReviewBadge" style="display:none;">0 need review</span>
+                <span class="settings-badge" id="previewLearningBadge">0 learning</span>
+            </div>
+        </div>
+        <div class="page-header-actions">
             <button class="btn btn-secondary" type="button" onclick="cancelPreview()">Cancel</button>
             <button class="btn btn-success" id="confirmBtn" onclick="confirmImport()"
                 style="display:flex; align-items:center; gap:6px;">
@@ -49,7 +88,7 @@
 
     <div class="inline-banner" id="previewReviewNote">
         <strong>Review mode</strong>
-        <span>Edit merchants/categories inline. Use “Apply to similar” to propagate fixes in the current batch. “Learn” stores the correction for future imports.</span>
+        <span>Edit merchants and categories inline. Use “Apply to similar” to propagate the current fix in this batch. Keep “Learn” on when the correction should improve future imports too.</span>
     </div>
 
     <div class="table-container">
@@ -125,6 +164,10 @@
             return;
         }
         previewData[index][field] = value;
+        if (field === 'category') {
+            previewData[index].needs_review = value === 'Uncategorized';
+            renderPreviewRows();
+        }
     }
 
     function togglePreviewLearning(index, checked) {
@@ -166,6 +209,87 @@
 
         renderPreviewRows();
         showToast(`Applied review changes to ${updated} similar row(s)`);
+    }
+
+    function applyCategorySuggestion(index, category) {
+        if (!previewData[index] || !category) {
+            return;
+        }
+        updatePreviewField(index, 'category', category);
+    }
+
+    function classificationSourceLabel(source) {
+        switch (source) {
+            case 'hybrid':
+                return 'Keyword fallback';
+            case 'fallback':
+                return 'Needs review';
+            case 'ml':
+                return 'ML';
+            case 'fuzzy':
+                return 'Similar merchant';
+            case 'exact':
+                return 'Merchant memory';
+            default:
+                return 'Review';
+        }
+    }
+
+    function confidenceLabel(score) {
+        if (typeof score !== 'number' || Number.isNaN(score)) {
+            return '';
+        }
+        return `${Math.round(score * 100)}%`;
+    }
+
+    function renderReviewAssist(index, txn) {
+        if (!txn?.needs_review) {
+            return '';
+        }
+
+        const sourceLabel = classificationSourceLabel(txn.classification_source);
+        const scoreLabel = confidenceLabel(txn.category_confidence);
+        const suggestions = Array.isArray(txn.category_suggestions)
+            ? txn.category_suggestions.filter(item => item && item.category && item.category !== txn.category).slice(0, 3)
+            : [];
+
+        const suggestionsHtml = suggestions.length
+            ? `<div class="preview-suggestions">${suggestions.map(item => `
+                <button class="btn btn-secondary btn-sm preview-suggestion-btn" type="button" onclick='applyCategorySuggestion(${index}, ${JSON.stringify(String(item.category))})'>
+                    ${escapeHtml(item.category)}${item.score != null ? ` · ${Math.round(Number(item.score) * 100)}%` : ''}
+                </button>
+            `).join('')}</div>`
+            : '';
+
+        return `
+            <div class="preview-review-block">
+                <span class="settings-badge warning">${escapeHtml(sourceLabel)}${scoreLabel ? ` · ${escapeHtml(scoreLabel)}` : ''}</span>
+                ${suggestionsHtml}
+            </div>
+        `;
+    }
+
+    function updatePreviewSummary() {
+        const countBadge = document.getElementById('previewCountBadge');
+        const reviewBadge = document.getElementById('previewNeedsReviewBadge');
+        const learningBadge = document.getElementById('previewLearningBadge');
+        if (!countBadge || !reviewBadge || !learningBadge) {
+            return;
+        }
+
+        const total = previewData.length;
+        const needsReview = previewData.filter(item => item.needs_review).length;
+        const learningCount = previewData.filter(item => item.apply_to_future !== false).length;
+
+        countBadge.textContent = `${total} row${total === 1 ? '' : 's'}`;
+        learningBadge.textContent = `${learningCount} learning`;
+
+        if (needsReview > 0) {
+            reviewBadge.style.display = '';
+            reviewBadge.textContent = `${needsReview} need review`;
+        } else {
+            reviewBadge.style.display = 'none';
+        }
     }
 
     // Drag & drop
@@ -258,6 +382,7 @@
     function showPreview(txns, message) {
         document.getElementById('previewTitle').textContent = message || `${txns.length} transactions`;
         renderPreviewRows();
+        updatePreviewSummary();
         document.getElementById('previewSection').classList.add('visible');
     }
 
@@ -328,6 +453,7 @@
                 <select class="settings-select preview-select" onchange="updatePreviewField(${index}, 'category', this.value)" aria-label="Category">
                     ${categoryOptionsHtml(t.category)}
                 </select>
+                ${renderReviewAssist(index, t)}
             </td>
             <td>
                 ${recurringHtml}
@@ -344,6 +470,7 @@
             </td>
         </tr>`;
         }).join('');
+        updatePreviewSummary();
     }
 
     function cancelPreview() {
@@ -351,6 +478,7 @@
         document.getElementById('uploadZone').style.display = '';
         previewData = [];
         fileInput.value = '';
+        updatePreviewSummary();
     }
 
     async function confirmImport() {

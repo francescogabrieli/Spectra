@@ -98,6 +98,39 @@ class TestParseCsv:
         assert txns[0].amount == -4.5  # debit
         assert txns[1].amount == 1500.0  # credit
 
+    def test_dedicated_counterparty_column(self, tmp_path: Path) -> None:
+        """A dedicated payee/beneficiary column should populate the counterpart directly."""
+        csv = tmp_path / "test.csv"
+        csv.write_text(dedent("""\
+            Date,Description,Payee,Amount,Currency
+            2026-02-22,SEPA TRANSFER,Andre Silva,-42.50,EUR
+        """))
+        txns = parse_csv(csv)
+        assert len(txns) == 1
+        assert txns[0].counterpart == "Andre Silva"
+
+    def test_isybank_transfer_extracts_counterpart_from_description(self, tmp_path: Path) -> None:
+        """Transfer descriptions should resolve the recipient even when buried in free text."""
+        csv = tmp_path / "test.csv"
+        csv.write_text(dedent("""\
+            Data;Operazione;Dettagli;Importo;Valuta
+            1/31/26;Bonifico istantaneo da voi disposto a favore di Daniele Magri;3526013184395777 Bonifico da Voi disposto a favore di Daniele Magri Hotel firenze;-141,00;EUR
+        """))
+        txns = parse_csv(csv)
+        assert len(txns) == 1
+        assert txns[0].counterpart == "Daniele Magri"
+
+    def test_generic_pos_operation_extracts_counterpart_from_details(self, tmp_path: Path) -> None:
+        """When the operation is generic, details should still yield the merchant/counterpart."""
+        csv = tmp_path / "test.csv"
+        csv.write_text(dedent("""\
+            Data;Operazione;Dettagli;Importo;Valuta
+            1/18/26;Pagamento Effettuato Su Pos Estero;Effettuato Il 18/01/2026 Alle Ore 1338 Mediante La Carta 5341 Xxxx Xxxx Xx40 Presso Porkbun.com Sherwood (ctv. Di 1081 Usd Al Cambio Di 0863334);-9,33;EUR
+        """))
+        txns = parse_csv(csv)
+        assert len(txns) == 1
+        assert txns[0].counterpart == "Porkbun.Com Sherwood"
+
     def test_dedup_ids_are_stable(self, tmp_path: Path) -> None:
         """Same data should produce the same IDs."""
         csv = tmp_path / "test.csv"

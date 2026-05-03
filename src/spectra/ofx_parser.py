@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from spectra.csv_parser import ParsedTransaction
+from spectra.csv_parser import ParsedTransaction, _extract_counterpart
 
 logger = logging.getLogger("spectra.ofx_parser")
 
@@ -39,13 +39,17 @@ def parse_ofx(
         for transaction in statement.transactions:
             if not transaction.amount and not transaction.date:
                 continue
+            payee = str(transaction.payee or "").strip()
+            memo = str(transaction.memo or "").strip()
+            raw_description = " ".join(part for part in [payee, memo] if part).strip()
             transactions.append(
                 ParsedTransaction(
                     id=transaction.id,
                     date=transaction.date.strftime("%Y-%m-%d"),
                     amount=transaction.amount,
                     currency=currency_default.upper(),
-                    raw_description=f"{transaction.payee} {transaction.memo}",
+                    raw_description=raw_description,
+                    counterpart=_extract_counterpart(raw_description, explicit_counterpart=payee),
                 )
             )
             logger.info(

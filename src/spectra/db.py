@@ -402,54 +402,73 @@ class BookmarkDB:
             self._normalize_rule_priorities()
         return cur.rowcount > 0
 
-    def get_training_data(self) -> list[tuple[str, str]]:
-        """Return (description, category) pairs for ML training.
+    def get_training_data(self) -> list[dict[str, str]]:
+        """Return structured local-classifier training rows.
 
-        Sources (in priority order):
-        1. User overrides — the gold-standard corrections by the user.
-        2. Transaction history — raw banking descriptions with their assigned category.
-        3. Merchant memory fallback — clean_name→category for old rows without raw descriptions.
+        The ML module resolves precedence and weights between these sources:
+        1. user overrides
+        2. merchant memory
+        3. tx history
         """
-        pairs: list[tuple[str, str]] = []
-        seen: set[str] = set()
+        examples: list[dict[str, str]] = []
 
-        # 1. User overrides (highest quality: the user explicitly corrected these)
-        for row in self._conn.execute(
-            "SELECT original_description, category FROM user_overrides WHERE category != ''"
-        ).fetchall():
-            desc, cat = row
-            if desc and cat and desc not in seen:
-                pairs.append((desc, cat))
-                seen.add(desc)
-
-        # 2. History rows that have a raw original_description
-        for row in self._conn.execute(
+        for original_description, category, clean_name in self._conn.execute(
             """
-            SELECT original_description, category
+            SELECT original_description, category, clean_name
+            FROM user_overrides
+            WHERE category != ''
+            """
+        ).fetchall():
+            if not original_description or not category:
+                continue
+            examples.append(
+                {
+                    "raw_description": str(original_description),
+                    "clean_name": str(clean_name or ""),
+                    "category": str(category),
+                    "label_source": "user_override",
+                }
+            )
+
+        for clean_name, category in self._conn.execute(
+            """
+            SELECT clean_name, category
+            FROM merchant_categories
+            WHERE category != ''
+            """
+        ).fetchall():
+            if not clean_name or not category:
+                continue
+            examples.append(
+                {
+                    "raw_description": "",
+                    "clean_name": str(clean_name),
+                    "category": str(category),
+                    "label_source": "merchant_memory",
+                }
+            )
+
+        for original_description, clean_name, category in self._conn.execute(
+            """
+            SELECT original_description, clean_name, category
             FROM tx_history
-            WHERE original_description != '' AND category != 'Uncategorized'
+            WHERE category != 'Uncategorized'
             """
         ).fetchall():
-            desc, cat = row
-            if desc and desc not in seen:
-                pairs.append((desc, cat))
-                seen.add(desc)
+            if not category:
+                continue
+            if not original_description and not clean_name:
+                continue
+            examples.append(
+                {
+                    "raw_description": str(original_description or ""),
+                    "clean_name": str(clean_name or ""),
+                    "category": str(category),
+                    "label_source": "tx_history",
+                }
+            )
 
-        # 3. Fallback: old history rows without original_description — use clean_name
-        for row in self._conn.execute(
-            """
-            SELECT h.clean_name, m.category
-            FROM tx_history h
-            INNER JOIN merchant_categories m ON h.clean_name = m.clean_name
-            WHERE (h.original_description IS NULL OR h.original_description = '')
-            """
-        ).fetchall():
-            desc, cat = row
-            if desc and cat and desc not in seen:
-                pairs.append((desc, cat))
-                seen.add(desc)
-
-        return pairs
+        return examples
 
     # ── LLM Feedback Overrides ───────────────────────────────────
 
