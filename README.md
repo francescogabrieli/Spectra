@@ -224,10 +224,7 @@ Data stays on host folders:
 ```bash
 git clone https://github.com/francescogabrieli/Spectra.git
 cd Spectra
-python3 -m venv .venv
-source .venv/bin/activate      # macOS/Linux
-# .venv\Scripts\activate       # Windows
-pip install -e .
+uv sync --locked
 ```
 
 #### 2) Configure `.env`
@@ -250,7 +247,7 @@ AI_PROVIDER=local
 #### 3) Run web app
 
 ```bash
-python -m spectra --serve
+uv run python -m spectra --serve
 ```
 
 Open: **[http://localhost:8080](http://localhost:8080)**
