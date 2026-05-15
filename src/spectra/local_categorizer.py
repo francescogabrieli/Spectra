@@ -13,54 +13,52 @@ logger = logging.getLogger("spectra.local")
 
 # ── Adaptive ML confidence thresholds ───────────────────────────
 
-_DEFAULT_ML_THRESHOLD = 0.20
-_DEFAULT_ML_MARGIN = 0.08
+_DEFAULT_ML_THRESHOLD = 0.15
+_DEFAULT_ML_MARGIN = 0.05
 _CATEGORY_ML_THRESHOLDS: dict[str, float] = {
-    # Ambiguous high-volume spend classes use a stricter threshold
-    "Shopping": 0.30,
-    "Groceries": 0.28,
-    "Food & Dining": 0.28,
-    "Entertainment": 0.27,
-    "Transport": 0.26,
-    "Travel": 0.26,
-    "Utilities": 0.24,
-    "Health": 0.24,
-    "Education": 0.24,
-    "Health & Fitness": 0.24,
-    # More specific classes can use a slightly lower threshold
-    "Digital Subscriptions": 0.22,
-    "Insurance": 0.22,
-    "Taxes": 0.20,
-    "Transfer": 0.19,
-    "Transfer In": 0.18,
-    "Reimbursement": 0.18,
-    "Cash Withdrawal": 0.18,
-    "Cash Deposit": 0.18,
-    "Salary": 0.16,
-    "Pension": 0.16,
+    "Shopping": 0.22,
+    "Groceries": 0.20,
+    "Food & Dining": 0.20,
+    "Entertainment": 0.19,
+    "Transport": 0.18,
+    "Travel": 0.18,
+    "Utilities": 0.16,
+    "Health": 0.16,
+    "Education": 0.16,
+    "Health & Fitness": 0.16,
+    "Digital Subscriptions": 0.14,
+    "Insurance": 0.14,
+    "Taxes": 0.13,
+    "Transfer": 0.12,
+    "Transfer In": 0.12,
+    "Reimbursement": 0.12,
+    "Cash Withdrawal": 0.12,
+    "Cash Deposit": 0.12,
+    "Salary": 0.10,
+    "Pension": 0.10,
 }
 
 _CATEGORY_ML_MARGINS: dict[str, float] = {
-    "Shopping": 0.12,
-    "Groceries": 0.10,
-    "Food & Dining": 0.10,
-    "Entertainment": 0.10,
-    "Transport": 0.09,
-    "Travel": 0.09,
-    "Utilities": 0.08,
-    "Health": 0.08,
-    "Education": 0.08,
-    "Health & Fitness": 0.08,
-    "Digital Subscriptions": 0.07,
-    "Insurance": 0.07,
-    "Taxes": 0.07,
-    "Transfer": 0.06,
-    "Transfer In": 0.06,
-    "Reimbursement": 0.06,
-    "Cash Withdrawal": 0.06,
-    "Cash Deposit": 0.06,
-    "Salary": 0.05,
-    "Pension": 0.05,
+    "Shopping": 0.08,
+    "Groceries": 0.07,
+    "Food & Dining": 0.07,
+    "Entertainment": 0.07,
+    "Transport": 0.06,
+    "Travel": 0.06,
+    "Utilities": 0.05,
+    "Health": 0.05,
+    "Education": 0.05,
+    "Health & Fitness": 0.05,
+    "Digital Subscriptions": 0.04,
+    "Insurance": 0.04,
+    "Taxes": 0.04,
+    "Transfer": 0.03,
+    "Transfer In": 0.03,
+    "Reimbursement": 0.03,
+    "Cash Withdrawal": 0.03,
+    "Cash Deposit": 0.03,
+    "Salary": 0.02,
+    "Pension": 0.02,
 }
 
 
@@ -95,19 +93,19 @@ _SALARY_RE = re.compile(
     r")"
 )
 _TRANSFER_IN_RE = re.compile(
-    r"(?i)\b(bonifico ricevuto|accredito bonifico|bonifico in entrata|incoming transfer|transfer received|virement re\u00e7u|transferencia recibida)\b"
+    r"(?i)\b(bonifico ricevuto|accredito bonifico|bonifico in entrata|incoming transfer|transfer received|virement re\u00e7u|transferencia recibida|bonifico a vostro favore|disposizione in entrata)\b"
 )
 _TRANSFER_RE = re.compile(
-    r"(?i)\b(bonifico|bank transfer|wire transfer|virement|transferencia|sepa transfer|giroconto)\b"
+    r"(?i)\b(bonifico|bank transfer|wire transfer|virement|transferencia|sepa transfer|giroconto|disposizione di pagamento|bonifico sepa|transfer|ordine di bonifico)\b"
 )
 _UTILITIES_RE = re.compile(
-    r"(?i)\b(bolletta|utenza|gas luce|electricity|water bill|telecom|telefonica|tim|vodafone|wind tre|windtre|iliad|fastweb|enel|a2a|iren|hera|acea)\b"
+    r"(?i)\b(bolletta|utenza|gas luce|electricity|water bill|telecom|telefonica|tim|vodafone|wind tre|windtre|iliad|fastweb|enel|a2a|iren|hera|acea|sorgenia|edison|e.on|engie|plenitude|tari|servizio elettrico|acquadotto|teleriscaldamento)\b"
 )
 _RECURRING_DEBIT_RE = re.compile(
-    r"(?i)\b(addebito sdd|direct debit|prélèvement sepa|prelevement sepa|lastschrift)\b"
+    r"(?i)\b(addebito sdd|direct debit|prélèvement sepa|prelevement sepa|lastschrift|addebito diretto|pagamento ricorrente|sepa direct debit)\b"
 )
 _SUBSCRIPTION_BRAND_RE = re.compile(
-    r"(?i)\b(netflix|spotify|apple|youtube|disney|dazn|prime|icloud|google one|openai|chatgpt|adobe|dropbox|github|notion)\b"
+    r"(?i)\b(netflix|spotify|apple|youtube|disney|dazn|prime|icloud|google one|openai|chatgpt|adobe|dropbox|github|notion|slack|zoom|aws|digitalocean|heroku|vercel|cloudflare|nordvpn|expressvpn|1password|lastpass|midjourney|anthropic|claude|sky|paramount|hbo|hulu)\b"
 )
 
 
