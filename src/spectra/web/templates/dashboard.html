@@ -134,18 +134,25 @@
     function getChartTheme() {
         return {
             fontFamily: cssVar('--font', 'Inter, sans-serif'),
-            textColor: cssVar('--text', '#37352F'),
-            mutedColor: cssVar('--text-muted', '#787774'),
-            gridColor: cssVar('--chart-grid', '#F1F1EF'),
-            accent: cssVar('--accent', '#2EAADC'),
+            textColor: cssVar('--text', '#111827'),
+            mutedColor: cssVar('--text-muted', '#6B7280'),
+            gridColor: cssVar('--chart-grid', '#F1F5F9'),
+            accent: cssVar('--accent', '#4F46E5'),
             palette: [
-                cssVar('--accent', '#2EAADC'),
-                cssVar('--positive', '#0F7B6C'),
-                cssVar('--warning', '#D9730D'),
-                cssVar('--negative', '#E03E3E'),
-                cssVar('--purple', '#9B51E0'),
-                '#6940A5', '#AD1A72', '#E16259', '#CC8E22', '#448361',
-                '#337EA9', '#CB912F', '#D44C47', '#6C6C6C',
+                cssVar('--accent', '#4F46E5'),       // indigo
+                cssVar('--positive', '#059669'),      // emerald
+                cssVar('--warning', '#D97706'),       // amber
+                cssVar('--negative', '#DC2626'),      // red
+                cssVar('--purple', '#7C3AED'),        // violet
+                '#0EA5E9',  // sky blue
+                '#DB2777',  // pink
+                '#EA580C',  // orange
+                '#65A30D',  // lime
+                '#0891B2',  // cyan
+                '#9333EA',  // purple
+                '#B45309',  // yellow-brown
+                '#BE123C',  // rose
+                '#4B5563',  // slate
             ],
         };
     }
@@ -164,24 +171,45 @@
                 datasets: [{
                     data: catValues,
                     backgroundColor: theme.palette.slice(0, catLabels.length),
-                    borderWidth: 0,
-                    hoverOffset: 4,
+                    borderWidth: 2,
+                    borderColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim() || '#fff',
+                    hoverOffset: 8,
+                    hoverBorderWidth: 0,
+                    spacing: 2,
                 }],
             },
             options: {
                 responsive: true,
+                animation: { duration: 600, easing: 'easeOutQuart' },
                 plugins: {
                     legend: {
                         position: 'right',
                         labels: {
                             color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 12 },
-                            padding: 12,
+                            font: { family: theme.fontFamily, size: 12, weight: '500' },
+                            padding: 14,
                             usePointStyle: true,
+                            pointStyleWidth: 8,
+                        },
+                    },
+                    tooltip: {
+                        backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim(),
+                        titleColor: theme.textColor,
+                        bodyColor: theme.mutedColor,
+                        borderColor: getComputedStyle(document.documentElement).getPropertyValue('--border').trim(),
+                        borderWidth: 1,
+                        padding: 12,
+                        cornerRadius: 8,
+                        callbacks: {
+                            label: ctx => {
+                                const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                                const pct = total > 0 ? Math.round(ctx.parsed / total * 100) : 0;
+                                return ` ${formatCurrency(ctx.parsed)} (${pct}%)`;
+                            },
                         },
                     },
                 },
-                cutout: '65%',
+                cutout: '70%',
             },
         });
 
@@ -202,16 +230,27 @@
                 datasets: [{
                     label: 'Spending',
                     data: monthValues,
-                    backgroundColor: theme.accent,
-                    borderRadius: 6,
+                    backgroundColor: theme.palette.map(c => c + 'CC'),
+                    backgroundColor: theme.accent + 'CC',
+                    hoverBackgroundColor: theme.accent,
+                    borderRadius: 8,
                     borderSkipped: false,
+                    borderWidth: 0,
                 }],
             },
             options: {
                 responsive: true,
+                animation: { duration: 500, easing: 'easeOutCubic' },
                 plugins: {
                     legend: { display: false },
                     tooltip: {
+                        backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim(),
+                        titleColor: theme.textColor,
+                        bodyColor: theme.mutedColor,
+                        borderColor: getComputedStyle(document.documentElement).getPropertyValue('--border').trim(),
+                        borderWidth: 1,
+                        padding: 12,
+                        cornerRadius: 8,
                         callbacks: {
                             title: context => {
                                 const key = periodKeys[context[0].dataIndex];
@@ -221,6 +260,7 @@
                                 }
                                 return formatCycleRange(range.start, range.end, { day: 'numeric', month: 'short', year: 'numeric' });
                             },
+                            label: ctx => ` ${formatCurrency(ctx.parsed.y)}`,
                         },
                     },
                 },
@@ -229,17 +269,20 @@
                         beginAtZero: true,
                         ticks: {
                             color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 11 },
-                            callback: v => '€' + v.toLocaleString(),
+                            font: { family: theme.fontFamily, size: 11, weight: '500' },
+                            callback: v => formatCurrency(v),
                         },
-                        grid: { color: theme.gridColor },
+                        grid: { color: theme.gridColor, lineWidth: 1 },
+                        border: { display: false },
                     },
                     x: {
                         ticks: {
                             color: theme.mutedColor,
                             font: { family: theme.fontFamily, size: 11 },
+                            maxRotation: 0,
                         },
                         grid: { display: false },
+                        border: { display: false },
                     },
                 },
             },

@@ -51,22 +51,47 @@ def parse_pdf(
 
     with pdfplumber.open(path) as pdf:
         # ── Strategy 1: Table extraction ─────────────────────────
-        transactions = _extract_from_tables(pdf, currency)
-        if transactions:
-            logger.info(
-                "Table extraction: %d transactions from %s",
-                len(transactions), path.name,
-            )
-            return transactions
+        table_transactions = _extract_from_tables(pdf, currency)
 
         # ── Strategy 2: Text-based regex extraction ───────────────
-        logger.info("No tables found, falling back to text extraction")
-        transactions = _extract_from_text_with_pypdf(path, PdfReader, currency)
-        logger.info(
-            "Text extraction: %d transactions from %s",
-            len(transactions), path.name,
-        )
-        return transactions
+        text_transactions = _extract_from_text_with_pypdf(path, PdfReader, currency)
+
+        if not table_transactions and not text_transactions:
+            return []
+
+        if table_transactions and text_transactions:
+            # Prefer the source that produced the most complete statement.
+            # Some PDFs expose a clean table, while others only parse reliably
+            # through text extraction when rows are wrapped across lines.
+            if len(text_transactions) >= len(table_transactions):
+                chosen = text_transactions
+                source = "text"
+            else:
+                chosen = table_transactions
+                source = "table"
+            logger.info(
+                "PDF extraction: %d table + %d text transactions → using %s (%d rows) from %s",
+                len(table_transactions),
+                len(text_transactions),
+                source,
+                len(chosen),
+                path.name,
+            )
+            return chosen
+        elif table_transactions:
+            logger.info(
+                "Table extraction: %d transactions from %s",
+                len(table_transactions),
+                path.name,
+            )
+            return table_transactions
+        else:
+            logger.info(
+                "Text extraction: %d transactions from %s",
+                len(text_transactions),
+                path.name,
+            )
+            return text_transactions
 
 
 # ── Strategy 1: Table extraction ─────────────────────────────────
@@ -136,12 +161,16 @@ def _rows_to_transactions(
                 debit = _parse_amount(raw_debit) if raw_debit else 0.0
                 amount = abs(credit) - abs(debit)
 
+            statement_category = row[col["category"]].strip() if "category" in col else ""
+            statement_category = statement_category.replace("€", "").strip()
+
             transactions.append(ParsedTransaction(
                 id=_make_id(date, description, amount),
                 date=date,
                 amount=amount,
                 currency=currency,
                 raw_description=description,
+                statement_category=statement_category,
             ))
         except (ValueError, IndexError) as e:
             skipped += 1
@@ -168,6 +197,52 @@ _TX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_BANK_TX_PATTERN = re.compile(
+    r"(?P<date>\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}|\d{4}[/\-\.]\d{2}[/\-\.]\d{2})"
+    r"\s+"
+    r"(?P<desc>.+?)"
+    r"\s+(?P<posted>SI|NO)"
+    r"\s+"
+    r"(?P<category>.+?)"
+    r"\s+"
+    r"(?P<amount>[+\-]?\s*[\d\.,]+)"
+    r"\s*(?:EUR|USD|GBP|CHF)?\s*$",
+    re.IGNORECASE,
+)
+
+_TX_START_RE = re.compile(
+    r"^\s*(?:\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}|\d{4}[/\-\.]\d{2}[/\-\.]\d{2})\b"
+)
+
+
+def _chunk_transaction_lines(lines: list[str]) -> list[str]:
+    """Join wrapped PDF lines into transaction-sized chunks.
+
+    Many bank PDFs split a single transaction over multiple visual lines.
+    We keep appending to the current chunk until the next line starts with a date.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if _TX_START_RE.match(line):
+            if current:
+                chunks.append(" ".join(current))
+            current = [line]
+            continue
+
+        if current:
+            current.append(line)
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
+
 
 def _extract_from_text_with_pypdf(
     file_path: Path,
@@ -180,12 +255,8 @@ def _extract_from_text_with_pypdf(
 
     for page in reader.pages:
         text = page.extract_text() or ""
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            m = _TX_PATTERN.match(line)
+        for chunk in _chunk_transaction_lines(text.splitlines()):
+            m = _BANK_TX_PATTERN.match(chunk) or _TX_PATTERN.match(chunk)
             if not m:
                 continue
 
@@ -200,6 +271,11 @@ def _extract_from_text_with_pypdf(
                     amount=amount,
                     currency=currency,
                     raw_description=description,
+                    statement_category=(
+                        m.group("category").replace("€", "").strip()
+                        if "category" in m.groupdict()
+                        else ""
+                    ),
                 ))
             except ValueError:
                 continue

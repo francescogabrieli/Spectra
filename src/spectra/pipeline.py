@@ -101,6 +101,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                         amount=t.amount,
                         currency=t.currency,
                         date=t.date,
+                        statement_category=getattr(t, "statement_category", ""),
                     )
                 )
                 override_count += 1
@@ -121,6 +122,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                         amount=t.amount,
                         currency=t.currency,
                         date=t.date,
+                        statement_category=getattr(t, "statement_category", ""),
                     )
                 )
                 rule_count += 1
@@ -142,6 +144,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                 {
                     "raw_description": t.raw_description,
                     "counterpart": getattr(t, "counterpart", ""),
+                    "statement_category": getattr(t, "statement_category", ""),
                     "amount": t.amount,
                     "currency": t.currency,
                     "date": t.date,

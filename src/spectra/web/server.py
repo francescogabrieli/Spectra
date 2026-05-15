@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from spectra.config import load_settings
+from spectra.config import Settings, load_settings
 from spectra.cycles import (
     CYCLE_MODE_FIXED,
     DEFAULT_CYCLE_RULE,
@@ -846,7 +846,7 @@ async def api_categories_options():
         ).fetchall()
     known_cats = [row[0] for row in cats]
     other_cats = [row[1] for row in build_seed_data()]
-    return {"categories": set(known_cats + other_cats)}
+    return {"categories": sorted(set(known_cats + other_cats))}
 
 # ── API: Settings ────────────────────────────────────────────────
 

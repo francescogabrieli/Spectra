@@ -223,12 +223,17 @@ _SEED_MERCHANTS: list[tuple[list[str], str]] = [
 
     # ── Income & Transfers ────────────────────────────────────
     (["Stipendio", "STIPENDIO MESE", "Salary", "Payroll", "Retribuzione",
+      "ACCREDITO STIPENDIO", "ACCREDITO RETRIBUZIONE", "ACCREDITO SALARIO",
+      "Accredito competenze", "Accredito emolumenti", "Bonifico stipendio",
+      "Emolumenti", "Competenze mensili", "Retribuzione mensile",
       "Gehalt", "Lohn", "Gehaltseingang",           # German
       "Salaire", "Virement salaire",                # French
       "Nómina", "Salario",                          # Spanish
       "Salário", "Ordenado"], "Salary"),             # Portuguese
-    (["Pensione", "Pension", "Rente", "Retraite", "Jubilación", "Pensão"], "Pension"),
+    (["Pensione", "Pension", "ACCREDITO PENSIONE", "INPS pensione",
+      "Rente", "Retraite", "Jubilación", "Pensão"], "Pension"),
     (["Bonifico ricevuto", "Accredito bonifico", "Bonifico in entrata",
+      "ACCREDITO BONIFICO", "Accredito da",
       "Incoming transfer", "Überweisung eingegangen",
       "Virement reçu", "Transferencia recibida"], "Transfer In"),
     (["Rimborso", "Refund", "Cashback",

@@ -54,6 +54,7 @@ _INCOME_PATTERNS = [
     re.compile(r"\bsalary\b", re.IGNORECASE),
     re.compile(r"\bpensione\b", re.IGNORECASE),
     re.compile(r"\bpension\b", re.IGNORECASE),
+    re.compile(r"\bstipendi?\s+e\s+pensioni\b", re.IGNORECASE),
     re.compile(r"\baccredito\s+(?:stipendio|competenze|emolumenti)\b", re.IGNORECASE),
     re.compile(r"\bbonifico\s+(?:a\s+(?:vostro|vs)\s+favore|ricevuto)\b", re.IGNORECASE),
     re.compile(r"\bpayroll\b", re.IGNORECASE),
@@ -66,9 +67,10 @@ def _detect_static_pattern(
     clean_name: str,
     original_description: str,
     amount: float,
+    statement_category: str = "",
 ) -> str:
     """Return 'Subscription', 'Salary/Income', or '' based purely on hardcoded pattern matching."""
-    combined = f"{clean_name} {original_description}".lower()
+    combined = f"{clean_name} {original_description} {statement_category}".lower()
 
     # ── Subscriptions: long merchant names (substring match) ──────
     for merchant in _SUBSCRIPTION_MERCHANTS:
@@ -98,7 +100,12 @@ def apply_recurring_tags(
 
     for t in transactions:
         # 1. Try static pattern matching first (fastest and most accurate for known entities)
-        static_match = _detect_static_pattern(t.clean_name, t.original_description, t.amount)
+        static_match = _detect_static_pattern(
+            t.clean_name,
+            t.original_description,
+            t.amount,
+            getattr(t, "statement_category", ""),
+        )
         if static_match:
             t.recurring = static_match
             # Add to running history so subsequent items in the loop see it

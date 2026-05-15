@@ -43,6 +43,9 @@ _COUNTERPART_ALIASES = {
     "ordinante", "mittente",
     "ragione sociale", "intestatario", "nome controparte",
 }
+_CATEGORY_ALIASES = {
+    "category", "categoria",
+}
 _AMOUNT_ALIASES = {
     "importo", "amount", "valore", "value", "ammontare",
     "importo eur", "amount eur", "saldo", "totale",
@@ -67,6 +70,7 @@ class ParsedTransaction:
     amount: float   # negative = expense, positive = income
     currency: str
     raw_description: str
+    statement_category: str = ""
     original_amount: float | None = None
     original_currency: str | None = None
     counterpart: str = ""
@@ -167,6 +171,8 @@ def _map_columns(headers: list[str]) -> dict[str, int]:
             mapping.setdefault("detail", i)   # secondary detail column
         if h in _COUNTERPART_ALIASES:
             mapping.setdefault("counterpart", i)
+        if h in _CATEGORY_ALIASES:
+            mapping.setdefault("category", i)
         if h in _AMOUNT_ALIASES:
             mapping.setdefault("amount", i)
         if h in _CREDIT_ALIASES:
@@ -432,6 +438,10 @@ def parse_csv(
                 if val:
                     row_currency = val
 
+            statement_category = ""
+            if "category" in col and col["category"] < len(row):
+                statement_category = row[col["category"]].strip()
+
             transactions.append(
                 ParsedTransaction(
                     id=tx_id,
@@ -439,6 +449,7 @@ def parse_csv(
                     amount=amount,
                     currency=row_currency,
                     raw_description=description,
+                    statement_category=statement_category,
                     counterpart=counterpart,
                 )
             )

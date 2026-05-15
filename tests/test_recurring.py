@@ -44,6 +44,22 @@ def test_apply_recurring_tags_static_income():
     assert len(history["Acme Corp"]) == 1
 
 
+def test_apply_recurring_tags_statement_category_income():
+    """Test that a bank statement category can also flag salary income."""
+    history = {}
+    txn = MockTransaction(
+        date="2026-04-30",
+        amount=1029.00,
+        clean_name="Accredito",
+        original_description="Accredito",
+    )
+    txn.statement_category = "Stipendi e pensioni"
+
+    apply_recurring_tags([txn], history)
+
+    assert txn.recurring == "Salary/Income"
+
+
 def test_apply_recurring_tags_temporal_monthly_subscription():
     """Test temporal hybrid logic detecting a ~30 day spacing."""
     # Seed history with 1 month ago

@@ -35,6 +35,7 @@ class CategorisedTransaction(BaseModel):
     original_currency: str | None = None
     date: str
     id: str  # Hash ID for dedup
+    statement_category: str = ""
     recurring: str = ""   # "Subscription", "Salary/Income", or empty
     classification_source: str = ""
     category_confidence: float | None = None
@@ -251,6 +252,7 @@ def categorise(
                     amount=amount,
                     currency=item.get("currency", base_currency),
                     date=date_str,
+                    statement_category=str(item.get("statement_category", "") or ""),
                     recurring=_normalize_recurring(item.get("recurring", ""), amount),
                     # These will be filled by the FX converter in the pipeline if needed
                     original_amount=None,

@@ -337,6 +337,49 @@ class TestAdaptiveThresholdAndHybridFallback:
         assert results[0].classification_source == "hybrid"
         assert results[0].needs_review is True
 
+    def test_statement_category_can_fallback_to_salary(self, monkeypatch: pytest.MonkeyPatch):
+        from spectra import ml_classifier
+
+        monkeypatch.setattr(
+            ml_classifier,
+            "predict_details",
+            lambda _clf, _desc, clean_name=None: SimpleNamespace(
+                category="Shopping",
+                confidence=0.18,
+                margin=0.03,
+                suggestions=[
+                    {"category": "Shopping", "score": 0.18},
+                    {"category": "Salary", "score": 0.17},
+                    {"category": "Transfer In", "score": 0.16},
+                ],
+            ),
+        )
+        results = categorise_local(
+            [self._txn("Accredito", amount=2400.00)],
+            merchant_db={},
+            ml_classifier=object(),
+        )
+        assert len(results) == 1
+        assert results[0].category == "Uncategorized"
+
+        results = categorise_local(
+            [
+                {
+                    "raw_description": "Accredito",
+                    "statement_category": "Stipendi e pensioni",
+                    "amount": 2400.0,
+                    "currency": "EUR",
+                    "date": "2026-02-01",
+                }
+            ],
+            merchant_db={},
+            ml_classifier=object(),
+        )
+        assert len(results) == 1
+        assert results[0].category == "Salary"
+        assert results[0].classification_source == "hybrid"
+        assert results[0].needs_review is True
+
     def test_low_confidence_ml_can_fallback_to_transfer_in(self, monkeypatch: pytest.MonkeyPatch):
         from spectra import ml_classifier
 

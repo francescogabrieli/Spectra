@@ -58,3 +58,35 @@ def test_extract_from_text_with_pypdf_skips_non_matching_lines(tmp_path: Path) -
     assert txns[0].date == "2026-02-22"
     assert txns[0].amount == -19.99
     assert txns[0].raw_description == "AMAZON"
+
+
+def test_extract_from_text_with_pypdf_parses_wrapped_transactions(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "statement.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _Page:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class _Reader:
+        def __init__(self, _: str) -> None:
+            self.pages = [
+                _Page(
+                    "30.04.2026 Stipendio O Pensione SI Stipendi e\n"
+                    "pensioni € 1.029,00\n"
+                    "29.04.2026 Openai NO Altre uscite € -5,22"
+                ),
+            ]
+
+    txns = _extract_from_text_with_pypdf(pdf_path, _Reader, "EUR")
+
+    assert len(txns) == 2
+    assert txns[0].date == "2026-04-30"
+    assert txns[0].amount == 1029.0
+    assert "Stipendio" in txns[0].raw_description
+    assert txns[0].statement_category.lower() == "stipendi e pensioni"
+    assert txns[1].date == "2026-04-29"
+    assert txns[1].amount == -5.22

@@ -75,10 +75,27 @@ def _ml_margin_for_category(category: str) -> float:
 # ── Hybrid fallback (keyword / regex) ───────────────────────────
 
 _SALARY_RE = re.compile(
-    r"(?i)\b(stipendio|salary|payroll|nomina|salario|salário|salaire|gehalt|lohn)\b"
+    r"(?i)(?:"
+    r"\b(stipendio|salary|payroll|n[oó]mina|salario|sal[aá]rio|salaire|gehalt|lohn)\b|"
+    r"\bstipendi\s+e\s+pensioni\b|"
+    r"\baccredito\s+stipendio\b|"
+    r"\baccredito\s+retribuzione\b|"
+    r"\baccredito\s+salario\b|"
+    r"\baccredito\s+emolumenti\b|"
+    r"\baccredito\s+competenze\b|"
+    r"\baccredito\s+(?:mensile|mensili)\b|"
+    r"\bbonafica\s+stipendio\b|"
+    r"\bbonifico\s+stipendio\b|"
+    r"\bretribuzione\b|"
+    r"\bemolumenti\b|"
+    r"\bcompetenze\s+mensili\b|"
+    r"virement\s+salaire|"
+    r"gehaltseingang|"
+    r"payroll\s+credit"
+    r")"
 )
 _TRANSFER_IN_RE = re.compile(
-    r"(?i)\b(bonifico ricevuto|accredito bonifico|incoming transfer|transfer received|virement reçu|transferencia recibida)\b"
+    r"(?i)\b(bonifico ricevuto|accredito bonifico|bonifico in entrata|incoming transfer|transfer received|virement re\u00e7u|transferencia recibida)\b"
 )
 _TRANSFER_RE = re.compile(
     r"(?i)\b(bonifico|bank transfer|wire transfer|virement|transferencia|sepa transfer|giroconto)\b"
@@ -94,9 +111,14 @@ _SUBSCRIPTION_BRAND_RE = re.compile(
 )
 
 
-def _hybrid_keyword_fallback(raw: str, clean_name: str, amount: float) -> str | None:
+def _hybrid_keyword_fallback(
+    raw: str,
+    clean_name: str,
+    amount: float,
+    statement_category: str = "",
+) -> str | None:
     """Rule-based fallback used when ML is missing or below confidence threshold."""
-    text = f"{raw} {clean_name}"
+    text = f"{raw} {clean_name} {statement_category}"
 
     if _SALARY_RE.search(text) and amount > 0:
         return "Salary"
@@ -304,6 +326,7 @@ def categorise_local(
         currency = t.get("currency", "EUR")
         date = t.get("date", "")
         counterpart = str(t.get("counterpart", "") or "").strip()
+        statement_category = str(t.get("statement_category", "") or "").strip()
 
         # Generate ID
         raw_id = f"{date}:{raw}:{amount}"
@@ -353,7 +376,7 @@ def categorise_local(
                         raw[:50], category, confidence * 100, min_confidence * 100, margin * 100, min_margin * 100,
                     )
                 else:
-                    fallback_cat = _hybrid_keyword_fallback(raw, clean_name, amount)
+                    fallback_cat = _hybrid_keyword_fallback(raw, clean_name, amount, statement_category)
                     if fallback_cat:
                         category = fallback_cat
                         classification_source = "hybrid"
@@ -373,7 +396,7 @@ def categorise_local(
                             raw[:50], confidence * 100, min_confidence * 100, margin * 100, min_margin * 100,
                         )
             except Exception:
-                fallback_cat = _hybrid_keyword_fallback(raw, clean_name, amount)
+                fallback_cat = _hybrid_keyword_fallback(raw, clean_name, amount, statement_category)
                 if fallback_cat:
                     category = fallback_cat
                     classification_source = "hybrid"
@@ -386,7 +409,7 @@ def categorise_local(
                     stats["fallback"] += 1
 
         # Step 5: Hybrid fallback (when ML is unavailable)
-        elif (fallback_cat := _hybrid_keyword_fallback(raw, clean_name, amount)):
+        elif (fallback_cat := _hybrid_keyword_fallback(raw, clean_name, amount, statement_category)):
             category = fallback_cat
             classification_source = "hybrid"
             needs_review = True
@@ -399,18 +422,29 @@ def categorise_local(
             needs_review = True
             stats["fallback"] += 1
 
-        # Income override: positive amounts not already categorised as income/transfer
+        # Income override: positive amounts classified as generic expense categories
+        # Only apply if the categorizer placed it in a non-income, non-transfer category
+        # AND it's a positive credit transaction. Never override explicit income/transfer categories.
         _INCOME_CATS = {
             "Salary", "Pension", "Transfer In", "Transfer",
             "Cash Deposit", "Other Income", "Investment Return",
-            "Reimbursement",
+            "Reimbursement", "Uncategorized",
         }
-        if amount > 0 and category not in _INCOME_CATS and category != "Uncategorized":
-            category = "Other Income"
-            category_confidence = None
-            category_suggestions = []
-            if not classification_source:
-                classification_source = "hybrid"
+        _EXPLICIT_EXPENSE_CATS = {
+            "Shopping", "Groceries", "Food & Dining", "Entertainment",
+            "Transport", "Travel", "Health", "Health & Fitness",
+            "Digital Subscriptions", "Insurance", "Utilities",
+            "Education", "Taxes", "Cash Withdrawal",
+        }
+        if amount > 0 and category not in _INCOME_CATS:
+            # Only relabel to Other Income if it landed on a clear expense category
+            # via a low-confidence path — don't override hybrid/keyword income signals
+            if category in _EXPLICIT_EXPENSE_CATS and classification_source not in ("hybrid", "exact", "fuzzy"):
+                category = "Other Income"
+                category_confidence = None
+                category_suggestions = []
+                if not classification_source:
+                    classification_source = "hybrid"
 
         recurring = ""
         results.append(
@@ -422,6 +456,7 @@ def categorise_local(
                 amount=amount,
                 currency=currency,
                 date=date,
+                statement_category=statement_category,
                 recurring=recurring,
                 original_amount=None,
                 original_currency=None,
