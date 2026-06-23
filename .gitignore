@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+src/*.egg-info/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -209,8 +210,9 @@ __marimo__/
 # Prism
 data/
 credentials.json
+secrets/
 inbox/20260223_ListaOperazioni.csv
 processed/
 inbox/
 .DS_Store
-architecture.md
+test_model.py

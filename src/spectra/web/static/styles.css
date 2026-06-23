@@ -512,6 +512,12 @@ body {
     overflow: hidden;
 }
 
+.card-link {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+}
+
 .card::before {
     content: '';
     position: absolute;
@@ -835,6 +841,116 @@ td.amount.income {
 
 .badge-uncategorized .badge-dot {
     background: var(--badge-warning-text);
+}
+
+.card-link {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+}
+
+.tx-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.tx-meta-badge {
+    font-size: 10px;
+    padding: 3px 7px;
+}
+
+.review-list {
+    padding: 16px;
+    display: grid;
+    gap: 14px;
+}
+
+.review-item {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 18px 20px;
+    box-shadow: var(--shadow-sm);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.review-item-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.review-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.02em;
+}
+
+.review-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.review-amount {
+    font-size: 18px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.review-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.review-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.review-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 40px;
+    padding: 0 2px;
+    color: var(--text);
+}
+
+.review-suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.review-suggestion {
+    white-space: nowrap;
+}
+
+.review-description {
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
+.review-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
 }
 
 /* ─── Upload Zone ──────────────────────────────────────────────── */
@@ -2176,6 +2292,14 @@ td.amount.income {
 
     .rules-builder {
         width: 100%;
+    }
+
+    .review-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .review-item-head {
+        flex-direction: column;
     }
 }
 

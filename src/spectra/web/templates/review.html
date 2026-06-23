@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+{% block title %}Review — Spectra{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Review</h1>
+        <p class="page-subtitle">Clear uncertain classifications and confirm internal transfer suggestions before they affect your analytics.</p>
+    </div>
+    <div class="page-header-actions">
+        <button class="btn btn-secondary btn-sm" type="button" onclick="exportReviewQueue()">Export CSV</button>
+        <a href="/upload" class="btn btn-secondary btn-sm">Upload</a>
+        <a href="/transactions" class="btn btn-secondary btn-sm">Transactions</a>
+    </div>
+</div>
+
+<div class="cards review-summary-cards">
+    <div class="card">
+        <div class="card-label">Review Items</div>
+        <div class="card-value warning" id="reviewTotalCount">—</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Transfer Suggestions</div>
+        <div class="card-value neutral" id="reviewTransferCount">—</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Current Batch</div>
+        <div class="card-value" id="reviewBatchCount">—</div>
+    </div>
+</div>
+
+<div class="table-container">
+    <div class="table-toolbar">
+        <select id="reasonFilter">
+            <option value="">Any reason</option>
+            <option value="low_confidence_category">Low confidence</option>
+            <option value="ambiguous_merchant">Ambiguous merchant</option>
+            <option value="transfer_candidate">Transfer candidate</option>
+        </select>
+        <select id="transferStatusFilter">
+            <option value="">Any transfer state</option>
+            <option value="suggested">Suggested</option>
+            <option value="confirmed">Confirmed</option>
+            <option value="dismissed">Dismissed</option>
+        </select>
+        <input type="text" id="batchFilter" placeholder="Import batch..." style="max-width: 220px;">
+        <button class="btn btn-secondary btn-sm" type="button" onclick="resetReviewFilters()">Reset filters</button>
+    </div>
+    <div class="results-summary">
+        <div class="results-summary-badges">
+            <span class="settings-badge local" id="reviewCountBadge">Loading…</span>
+            <span class="settings-badge" id="reviewFilterBadge">No filters</span>
+        </div>
+        <div class="table-cell-muted" id="reviewSummaryText">Loading review queue…</div>
+    </div>
+    <div id="reviewList" class="review-list">
+        <div class="empty-state">
+            <div class="icon">⏳</div>
+            <h3>Loading…</h3>
+        </div>
+    </div>
+    <div class="pagination" id="reviewPagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let reviewPage = 1;
+    let reviewCategories = [];
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#39;');
+    }
+
+    async function loadReviewCategories() {
+        try {
+            const res = await fetch('/api/categories/options');
+            const data = await res.json();
+            reviewCategories = Array.isArray(data.categories) ? data.categories : [];
+        } catch (_err) {
+            reviewCategories = [];
+        }
+    }
+
+    function categoryOptionsHtml(selected = '') {
+        const options = ['Uncategorized', ...reviewCategories];
+        return options
+            .filter((value, index, self) => value && self.indexOf(value) === index)
+            .map(category => `<option value="${escapeHtml(category)}" ${category === selected ? 'selected' : ''}>${escapeHtml(category)}</option>`)
+            .join('');
+    }
+
+    function filterCount(filters) {
+        let count = 0;
+        if (filters.reason) count += 1;
+        if (filters.transferStatus) count += 1;
+        if (filters.batch) count += 1;
+        return count;
+    }
+
+    function currentFilters() {
+        return {
+            reason: document.getElementById('reasonFilter').value,
+            transferStatus: document.getElementById('transferStatusFilter').value,
+            batch: document.getElementById('batchFilter').value.trim(),
+        };
+    }
+
+    function buildReviewParams(includePagination = true) {
+        const filters = currentFilters();
+        const params = new URLSearchParams();
+        if (includePagination) {
+            params.set('page', String(reviewPage));
+            params.set('per_page', '50');
+        }
+        if (filters.reason) params.set('reason', filters.reason);
+        if (filters.transferStatus) params.set('transfer_status', filters.transferStatus);
+        if (filters.batch) params.set('import_batch_id', filters.batch);
+        return params;
+    }
+
+    function resetReviewFilters() {
+        document.getElementById('reasonFilter').value = '';
+        document.getElementById('transferStatusFilter').value = '';
+        document.getElementById('batchFilter').value = '';
+        loadReview(1);
+    }
+
+    function updateSummary(data, filters) {
+        const total = Number(data.total || 0);
+        const countBadge = document.getElementById('reviewCountBadge');
+        const filterBadge = document.getElementById('reviewFilterBadge');
+        const summaryText = document.getElementById('reviewSummaryText');
+        if (!countBadge || !filterBadge || !summaryText) {
+            return;
+        }
+
+        countBadge.textContent = `${total} item${total === 1 ? '' : 's'}`;
+        const count = filterCount(filters);
+        filterBadge.textContent = count ? `${count} filter${count === 1 ? '' : 's'} active` : 'No filters';
+        summaryText.textContent = total
+            ? 'Triage items newest-first. Confirm transfer pairs or fix categories and merchants in one place.'
+            : 'No review items are currently pending.';
+
+        const batchCount = new Set((data.items || []).map(item => item.import_batch_id).filter(Boolean)).size;
+        document.getElementById('reviewBatchCount').textContent = batchCount.toLocaleString();
+        document.getElementById('reviewTotalCount').textContent = total.toLocaleString();
+        const transferCount = (data.items || []).filter(item => item.transfer_status === 'suggested').length;
+        document.getElementById('reviewTransferCount').textContent = transferCount.toLocaleString();
+    }
+
+    function renderSuggestions(item, index) {
+        const suggestions = Array.isArray(item.category_suggestions) ? item.category_suggestions.slice(0, 3) : [];
+        if (!suggestions.length) {
+            return '';
+        }
+        return `<div class="review-suggestions">
+            ${suggestions.map(suggestion => `
+                <button class="btn btn-secondary btn-sm review-suggestion" type="button" onclick="applySuggestion(${index}, ${JSON.stringify(String(suggestion.category))})">
+                    ${escapeHtml(suggestion.category)}${suggestion.score != null ? ` · ${Math.round(Number(suggestion.score) * 100)}%` : ''}
+                </button>
+            `).join('')}
+        </div>`;
+    }
+
+    function renderReviewItems(items) {
+        const container = document.getElementById('reviewList');
+        if (!items.length) {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <div class="icon">✅</div>
+                    <h3>All caught up</h3>
+                    <p>No items currently need review.</p>
+                    <a href="/transactions" class="btn btn-primary" style="margin-top:16px;">Open Transactions</a>
+                </div>`;
+            return;
+        }
+
+        container.innerHTML = items.map((item, index) => `
+            <article class="review-item">
+                <div class="review-item-head">
+                    <div>
+                        <div class="review-title">${escapeHtml(item.merchant)}</div>
+                        <div class="review-meta">
+                            <span class="settings-badge ${item.needs_review ? 'warning' : ''}">${escapeHtml(item.review_reason || 'review')}</span>
+                            ${item.transfer_status && item.transfer_status !== 'none' ? `<span class="settings-badge">${escapeHtml(item.transfer_status)}</span>` : ''}
+                            ${item.classification_source ? `<span class="settings-badge local">${escapeHtml(item.classification_source)}</span>` : ''}
+                            ${item.account_name ? `<span class="settings-badge">${escapeHtml(item.account_name)}</span>` : ''}
+                            ${item.import_batch_id ? `<span class="settings-badge">${escapeHtml(item.import_batch_id)}</span>` : ''}
+                        </div>
+                    </div>
+                    <div class="review-amount ${item.amount < 0 ? 'expense' : 'income'}">${formatCurrency(item.amount, item.currency)}</div>
+                </div>
+                <div class="review-grid">
+                    <label class="review-field">
+                        <span>Merchant</span>
+                        <input class="settings-input" value="${escapeHtml(item.merchant)}" data-review-merchant="${index}">
+                    </label>
+                    <label class="review-field">
+                        <span>Category</span>
+                        <select class="settings-select" data-review-category="${index}">
+                            ${categoryOptionsHtml(item.category)}
+                        </select>
+                    </label>
+                    <label class="review-field">
+                        <span>Learn</span>
+                        <div class="review-toggle">
+                            <input type="checkbox" ${item.apply_to_future === false ? '' : 'checked'} data-review-learn="${index}">
+                            <span>Apply to future</span>
+                        </div>
+                    </label>
+                </div>
+                ${renderSuggestions(item, index)}
+                <div class="table-cell-muted review-description">${escapeHtml(item.original_description || '')}</div>
+                <div class="review-actions">
+                    <button class="btn btn-primary btn-sm" type="button" onclick="saveReview(${index}, true)">Save review</button>
+                    <button class="btn btn-secondary btn-sm" type="button" onclick="saveReview(${index}, false)">Mark reviewed</button>
+                    ${item.transfer_status === 'suggested' && item.transfer_group_id ? `
+                        <button class="btn btn-success btn-sm" type="button" onclick="confirmTransfer(${JSON.stringify(item.transfer_group_id)})">Confirm transfer</button>
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="dismissTransfer(${JSON.stringify(item.transfer_group_id)})">Dismiss transfer</button>
+                    ` : ''}
+                </div>
+            </article>
+        `).join('');
+    }
+
+    function getRowValue(index, selector) {
+        const el = document.querySelector(`[${selector}="${index}"]`);
+        return el;
+    }
+
+    function applySuggestion(index, category) {
+        const select = document.querySelector(`[data-review-category="${index}"]`);
+        if (select) {
+            select.value = category;
+        }
+    }
+
+    async function saveReview(index, applyToFuture = true) {
+        const merchant = document.querySelector(`[data-review-merchant="${index}"]`)?.value?.trim() || '';
+        const category = document.querySelector(`[data-review-category="${index}"]`)?.value?.trim() || '';
+        const learn = document.querySelector(`[data-review-learn="${index}"]`)?.checked ?? applyToFuture;
+        const item = lastItems[index];
+        if (!item) {
+            return;
+        }
+
+        const body = {
+            merchant: merchant || item.merchant,
+            category: category || item.category,
+            apply_to_future: learn,
+            mark_reviewed: true,
+        };
+
+        const res = await fetch(`/api/review/${encodeURIComponent(item.id)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+            showToast(data.error || 'Review update failed', 'error');
+            return;
+        }
+        showToast('Review saved');
+        loadReview(reviewPage);
+    }
+
+    async function confirmTransfer(groupId) {
+        const res = await fetch('/api/transfers/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transfer_group_id: groupId, action: 'confirm' }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+            showToast(data.error || 'Transfer confirmation failed', 'error');
+            return;
+        }
+        showToast('Transfer confirmed');
+        loadReview(reviewPage);
+    }
+
+    async function dismissTransfer(groupId) {
+        const res = await fetch('/api/transfers/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transfer_group_id: groupId, action: 'dismiss' }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+            showToast(data.error || 'Transfer dismissal failed', 'error');
+            return;
+        }
+        showToast('Transfer dismissed');
+        loadReview(reviewPage);
+    }
+
+    function renderPagination(page, total) {
+        const container = document.getElementById('reviewPagination');
+        if (total <= 1) {
+            container.innerHTML = '';
+            return;
+        }
+        let html = `<button ${page <= 1 ? 'disabled' : ''} onclick="loadReview(${page - 1})">← Prev</button>`;
+        html += `<span class="pagination-info">Page ${page} of ${total}</span>`;
+        html += `<button ${page >= total ? 'disabled' : ''} onclick="loadReview(${page + 1})">Next →</button>`;
+        container.innerHTML = html;
+    }
+
+    let lastItems = [];
+
+    async function loadReview(page = 1) {
+        reviewPage = page;
+        const filters = currentFilters();
+        const params = buildReviewParams(true);
+
+        const res = await fetch(`/api/review?${params}`);
+        const data = await res.json();
+        lastItems = Array.isArray(data.items) ? data.items : [];
+        renderReviewItems(lastItems);
+        renderPagination(data.page, data.pages);
+        updateSummary(data, filters);
+    }
+
+    document.getElementById('reasonFilter').addEventListener('change', () => loadReview(1));
+    document.getElementById('transferStatusFilter').addEventListener('change', () => loadReview(1));
+    document.getElementById('batchFilter').addEventListener('input', () => {
+        clearTimeout(window.__reviewBatchTimer);
+        window.__reviewBatchTimer = setTimeout(() => loadReview(1), 250);
+    });
+
+    function exportReviewQueue() {
+        window.location = `/api/exports/review?${buildReviewParams(false)}`;
+    }
+
+    loadReviewCategories().then(() => loadReview());
+</script>
+{% endblock %}

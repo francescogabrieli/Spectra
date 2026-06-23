@@ -70,6 +70,7 @@
             <div class="preview-meta" id="previewMeta">
                 <span class="settings-badge local" id="previewCountBadge">0 rows</span>
                 <span class="settings-badge warning" id="previewNeedsReviewBadge" style="display:none;">0 need review</span>
+                <span class="settings-badge" id="previewTransferBadge" style="display:none;">0 transfer suggestions</span>
                 <span class="settings-badge" id="previewLearningBadge">0 learning</span>
             </div>
         </div>
@@ -272,13 +273,15 @@
     function updatePreviewSummary() {
         const countBadge = document.getElementById('previewCountBadge');
         const reviewBadge = document.getElementById('previewNeedsReviewBadge');
+        const transferBadge = document.getElementById('previewTransferBadge');
         const learningBadge = document.getElementById('previewLearningBadge');
-        if (!countBadge || !reviewBadge || !learningBadge) {
+        if (!countBadge || !reviewBadge || !transferBadge || !learningBadge) {
             return;
         }
 
         const total = previewData.length;
         const needsReview = previewData.filter(item => item.needs_review).length;
+        const transferCount = previewData.filter(item => item.transfer_status === 'suggested').length;
         const learningCount = previewData.filter(item => item.apply_to_future !== false).length;
 
         countBadge.textContent = `${total} row${total === 1 ? '' : 's'}`;
@@ -289,6 +292,13 @@
             reviewBadge.textContent = `${needsReview} need review`;
         } else {
             reviewBadge.style.display = 'none';
+        }
+
+        if (transferCount > 0) {
+            transferBadge.style.display = '';
+            transferBadge.textContent = `${transferCount} transfer suggestion${transferCount === 1 ? '' : 's'}`;
+        } else {
+            transferBadge.style.display = 'none';
         }
     }
 
@@ -495,7 +505,7 @@
             const data = await res.json();
             showToast(data.message || 'Transactions saved!');
 
-            setTimeout(() => { window.location.href = '/transactions'; }, 1500);
+            setTimeout(() => { window.location.href = data.redirect_to || '/transactions'; }, 1500);
         } catch (err) {
             showToast('Save failed: ' + err.message, 'error');
             btn.disabled = false;

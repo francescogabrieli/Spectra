@@ -1,3 +1,5 @@
+"""Small playground for testing description-cleaning regexes locally."""
+
 import re
 
 texts = [
@@ -32,5 +34,11 @@ def clean(text):
             
     return text
 
-for t in texts:
-    print(clean(t))
+
+def main() -> None:
+    for text in texts:
+        print(clean(text))
+
+
+if __name__ == "__main__":
+    main()

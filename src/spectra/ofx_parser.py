@@ -50,6 +50,7 @@ def parse_ofx(
                     currency=currency_default.upper(),
                     raw_description=raw_description,
                     counterpart=_extract_counterpart(raw_description, explicit_counterpart=payee),
+                    account_name=str(account.account_id or "").strip(),
                 )
             )
             logger.info(

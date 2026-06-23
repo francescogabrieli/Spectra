@@ -68,7 +68,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Layout centering fixed across all pages — content now respects a `max-width: 1200px` container centered in the main area (`main-inner` wrapper)
-- `architecture.md` updated to reflect web upload flow, Custom Rules engine, Human-in-the-loop layer, Learning Center, and expanded dashboard pages
+- `docs/architecture.md` updated to reflect web upload flow, Custom Rules engine, Human-in-the-loop layer, Learning Center, and expanded dashboard pages
 - License corrected in `pyproject.toml` from MIT to AGPL-3.0-or-later (LICENSE file was always AGPL)
 
 ### Fixed

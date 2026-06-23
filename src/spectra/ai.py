@@ -37,10 +37,17 @@ class CategorisedTransaction(BaseModel):
     id: str  # Hash ID for dedup
     statement_category: str = ""
     recurring: str = ""   # "Subscription", "Salary/Income", or empty
+    counterpart: str = ""
     classification_source: str = ""
     category_confidence: float | None = None
     category_suggestions: list[CategorySuggestion] = Field(default_factory=list)
     needs_review: bool = False
+    review_reason: str = ""
+    account_name: str = ""
+    import_batch_id: str = ""
+    transfer_group_id: str = ""
+    transfer_status: str = "none"
+    excluded_from_spend: bool = False
 
 
 # ── Prompt ───────────────────────────────────────────────────────
@@ -254,9 +261,11 @@ def categorise(
                     date=date_str,
                     statement_category=str(item.get("statement_category", "") or ""),
                     recurring=_normalize_recurring(item.get("recurring", ""), amount),
+                    counterpart=str(item.get("counterpart", "") or ""),
                     # These will be filled by the FX converter in the pipeline if needed
                     original_amount=None,
                     original_currency=None,
+                    classification_source=provider,
                 )
             )
         except Exception:

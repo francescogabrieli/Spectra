@@ -6,12 +6,14 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from spectra.ai import CategorisedTransaction, categorise
 from spectra.config import Settings, load_settings
 from spectra.csv_parser import ParsedTransaction, parse_csv
 from spectra.dashboard import refresh_dashboard
 from spectra.db import BookmarkDB
+from spectra.review import apply_review_state, build_import_batch_id, match_internal_transfers
 from spectra.rules import first_matching_rule
 from spectra.sheets import SheetsClient
 
@@ -29,6 +31,58 @@ def _parse_file(file_path: str, currency: str) -> list[ParsedTransaction]:
         return parse_ofx(file_path)
     else:
         return parse_csv(file_path, currency=currency)
+
+
+def _source_key(*, tx_date: str, raw_description: str, amount: float) -> tuple[str, str, float]:
+    return (str(tx_date), str(raw_description), round(float(amount), 2))
+
+
+def _enrich_categorised_transactions(
+    categorised: list[CategorisedTransaction],
+    *,
+    source_transactions: list[ParsedTransaction],
+    import_batch_id: str,
+    provider: str,
+) -> None:
+    """Propagate parser metadata and stable IDs into categorized rows."""
+    source_lookup: dict[tuple[str, str, float], list[ParsedTransaction]] = {}
+    for source_tx in source_transactions:
+        key = _source_key(
+            tx_date=source_tx.date,
+            raw_description=source_tx.raw_description,
+            amount=source_tx.amount,
+        )
+        source_lookup.setdefault(key, []).append(source_tx)
+
+    for tx in categorised:
+        key = _source_key(
+            tx_date=tx.date,
+            raw_description=tx.original_description,
+            amount=tx.amount,
+        )
+        source_matches = source_lookup.get(key, [])
+        source_tx = source_matches.pop(0) if source_matches else None
+        if source_tx is not None:
+            tx.id = source_tx.id
+            tx.counterpart = str(getattr(source_tx, "counterpart", "") or tx.counterpart or "")
+            tx.account_name = str(getattr(source_tx, "account_name", "") or "")
+            if not tx.statement_category:
+                tx.statement_category = str(getattr(source_tx, "statement_category", "") or "")
+        if not tx.classification_source:
+            tx.classification_source = provider
+        tx.import_batch_id = import_batch_id
+
+
+def _load_existing_transfer_candidates(db: BookmarkDB, transactions: list[CategorisedTransaction]) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    for tx in transactions:
+        for row in db.find_transfer_candidates(
+            tx_date=tx.date,
+            amount=float(tx.amount),
+            exclude_ids=[str(tx.id)],
+        ):
+            candidates.setdefault(str(row["id"]), row)
+    return list(candidates.values())
 
 def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
     """Process a bank CSV or PDF export → AI → Google Sheets."""
@@ -79,6 +133,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
 
         logger.info("📂 Existing categories: %s", existing_categories or "(none)")
         category_rules = db.get_category_rules()
+        import_batch_id = build_import_batch_id()
 
         # ── Step 3b: Local Override Matching (skip LLM if mapped) ────
         to_llm = []
@@ -102,6 +157,10 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                         currency=t.currency,
                         date=t.date,
                         statement_category=getattr(t, "statement_category", ""),
+                        counterpart=counterpart,
+                        classification_source="override",
+                        account_name=str(getattr(t, "account_name", "") or ""),
+                        import_batch_id=import_batch_id,
                     )
                 )
                 override_count += 1
@@ -123,6 +182,10 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                         currency=t.currency,
                         date=t.date,
                         statement_category=getattr(t, "statement_category", ""),
+                        counterpart=counterpart,
+                        classification_source="rule",
+                        account_name=str(getattr(t, "account_name", "") or ""),
+                        import_batch_id=import_batch_id,
                     )
                 )
                 rule_count += 1
@@ -145,6 +208,7 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                     "raw_description": t.raw_description,
                     "counterpart": getattr(t, "counterpart", ""),
                     "statement_category": getattr(t, "statement_category", ""),
+                    "id": t.id,
                     "amount": t.amount,
                     "currency": t.currency,
                     "date": t.date,
@@ -185,13 +249,20 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                     logger.warning("⚠️  LLM returned no results for %d transactions", len(to_llm))
                 else:
                     categorised.extend(llm_results)
-                
+
         # Merge pre-categorised (overrides) and LLM-categorised
         categorised.extend(pre_categorised)
 
         if not categorised:
             logger.warning("⚠️ No transactions were categorised.")
             return
+
+        _enrich_categorised_transactions(
+            categorised,
+            source_transactions=new_txns,
+            import_batch_id=import_batch_id,
+            provider=settings.ai_provider,
+        )
 
         # ── Step 4b: Deterministic recurring detection ────────────
         from spectra.recurring import apply_recurring_tags
@@ -213,6 +284,15 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
                 t.amount = converted
                 t.currency = settings.base_currency
 
+        for tx in categorised:
+            apply_review_state(tx)
+
+        existing_transfer_candidates = _load_existing_transfer_candidates(db, categorised)
+        existing_transfer_updates = match_internal_transfers(
+            categorised,
+            existing_candidates=existing_transfer_candidates,
+        )
+
         # ── Step 5: Write or print ───────────────────────────────
         if dry_run:
             from spectra.reporter import generate_html_report
@@ -220,12 +300,15 @@ def run(settings: Settings, file: str, currency: str, dry_run: bool) -> None:
             generate_html_report(categorised)
             logger.info("✅ Report generated and opened in browser")
         else:
-            sheets.append_transactions(categorised)
             # Save history (date, amount, clean_name) for future temporal recurring detection
             db.save_history(categorised)
+            for update in existing_transfer_updates:
+                tx_id = str(update.pop("tx_id"))
+                db.update_transaction(tx_id, **update)
             # Save merchant→category mappings for future local mode runs
             new_mappings = {t.clean_name: t.category for t in categorised if t.category != "Uncategorized"}
             db.save_merchant_categories_batch(new_mappings)
+            sheets.append_transactions(categorised)
             logger.info("✅ Done — %d rows written to Google Sheets", len(categorised))
 
             # Refresh the Dashboard tab with updated charts

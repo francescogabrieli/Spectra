@@ -467,7 +467,7 @@ def train_classifier(
             max_iter=2000,
             C=3.0,
             class_weight="balanced",
-            solver="liblinear",
+            solver="saga",
             random_state=42,
         )),
     ])

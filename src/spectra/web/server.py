@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import logging
+import csv
+import io
 import re
 import shutil
 import tempfile
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from spectra.ai import CategorisedTransaction
 from spectra.config import Settings, load_settings
 from spectra.cycles import (
     CYCLE_MODE_FIXED,
@@ -32,7 +36,17 @@ from spectra.cycles import (
 )
 from spectra.db import BookmarkDB
 from spectra.ml_classifier import build_seed_data
+from spectra.pipeline import _enrich_categorised_transactions, _load_existing_transfer_candidates
 from spectra.recurring import detect_recurring_kind
+from spectra.review import (
+    TRANSFER_STATUS_CONFIRMED,
+    TRANSFER_STATUS_DISMISSED,
+    TRANSFER_STATUS_NONE,
+    TRANSFER_STATUS_SUGGESTED,
+    apply_review_state,
+    build_import_batch_id,
+    match_internal_transfers,
+)
 from spectra.rules import VALID_RULE_TYPES, normalize_rule_type
 
 logger = logging.getLogger("spectra.web")
@@ -51,6 +65,28 @@ _BASE_CURRENCY_SETTING_KEY = "base_currency"
 _VALID_THEME_PREFERENCES = {"auto", "light", "dark"}
 _VALID_SUMMARY_SCOPES = {"cycle", "90d", "ytd"}
 _CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+_TRANSACTION_EXPORT_HEADERS = [
+    "tx_id",
+    "date",
+    "merchant",
+    "category",
+    "amount",
+    "currency",
+    "original_amount",
+    "original_currency",
+    "original_description",
+    "counterpart",
+    "recurring",
+    "classification_source",
+    "category_confidence",
+    "needs_review",
+    "review_reason",
+    "account_name",
+    "import_batch_id",
+    "transfer_group_id",
+    "transfer_status",
+    "excluded_from_spend",
+]
 
 
 # ── Global error handler ─────────────────────────────────────────
@@ -199,6 +235,44 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _csv_safe_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return value
+
+
+def _transactions_to_csv(rows: list[dict[str, Any]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(_TRANSACTION_EXPORT_HEADERS)
+    for row in rows:
+        writer.writerow([
+            _csv_safe_value(row.get("id")),
+            _csv_safe_value(row.get("date")),
+            _csv_safe_value(row.get("merchant")),
+            _csv_safe_value(row.get("category")),
+            _csv_safe_value(row.get("amount")),
+            _csv_safe_value(row.get("currency")),
+            _csv_safe_value(row.get("original_amount")),
+            _csv_safe_value(row.get("original_currency")),
+            _csv_safe_value(row.get("original_description")),
+            _csv_safe_value(row.get("counterpart")),
+            _csv_safe_value(row.get("recurring")),
+            _csv_safe_value(row.get("classification_source")),
+            _csv_safe_value(row.get("category_confidence")),
+            _csv_safe_value(int(bool(row.get("needs_review")))),
+            _csv_safe_value(row.get("review_reason")),
+            _csv_safe_value(row.get("account_name")),
+            _csv_safe_value(row.get("import_batch_id")),
+            _csv_safe_value(row.get("transfer_group_id")),
+            _csv_safe_value(row.get("transfer_status")),
+            _csv_safe_value(int(bool(row.get("excluded_from_spend")))),
+        ])
+    return buffer.getvalue()
+
+
 def _persist_learning(
     db: BookmarkDB,
     *,
@@ -234,6 +308,84 @@ def _persist_learning(
         category=normalized_category,
         source=source,
         apply_to_future=apply_to_future,
+    )
+
+
+def _normalize_transfer_category(amount: float) -> str:
+    return "Transfer In" if float(amount) > 0 else "Transfer"
+
+
+def _refresh_review_state(db: BookmarkDB, tx_id: str) -> dict[str, Any] | None:
+    tx = db.get_transaction(tx_id)
+    if not tx:
+        return None
+    needs_review, review_reason = apply_review_state(tx)
+    db.update_transaction(
+        tx_id,
+        needs_review=1 if needs_review else 0,
+        review_reason=review_reason,
+    )
+    return db.get_transaction(tx_id)
+
+
+def _serialize_transaction_model(tx: CategorisedTransaction, *, include_preview_only: bool = False) -> dict[str, Any]:
+    row = {
+        "id": tx.id,
+        "date": tx.date,
+        "merchant": tx.clean_name,
+        "category": tx.category,
+        "amount": tx.amount,
+        "currency": tx.currency,
+        "recurring": tx.recurring,
+        "original_description": tx.original_description,
+        "counterpart": tx.counterpart,
+        "classification_source": tx.classification_source,
+        "category_confidence": tx.category_confidence,
+        "needs_review": tx.needs_review,
+        "review_reason": tx.review_reason,
+        "account_name": tx.account_name,
+        "import_batch_id": tx.import_batch_id,
+        "transfer_group_id": tx.transfer_group_id,
+        "transfer_status": tx.transfer_status,
+        "excluded_from_spend": tx.excluded_from_spend,
+        "original_amount": tx.original_amount,
+        "original_currency": tx.original_currency,
+    }
+    if getattr(tx, "category_suggestions", None):
+        row["category_suggestions"] = [
+            suggestion.model_dump()
+            if hasattr(suggestion, "model_dump")
+            else dict(suggestion)
+            for suggestion in tx.category_suggestions
+        ]
+    if include_preview_only and not row["classification_source"]:
+        row.pop("classification_source", None)
+    return row
+
+
+def _payload_to_transaction(payload: dict[str, Any], *, base_currency: str) -> CategorisedTransaction:
+    return CategorisedTransaction(
+        id=str(payload["id"]),
+        original_description=str(payload.get("original_description", "") or ""),
+        clean_name=str(payload.get("merchant", "") or ""),
+        category=str(payload.get("category", "Uncategorized") or "Uncategorized"),
+        amount=float(payload.get("amount", 0) or 0),
+        currency=str(payload.get("currency", base_currency) or base_currency),
+        original_amount=payload.get("original_amount"),
+        original_currency=payload.get("original_currency"),
+        date=str(payload.get("date", "") or ""),
+        statement_category=str(payload.get("statement_category", "") or ""),
+        recurring=str(payload.get("recurring", "") or ""),
+        counterpart=str(payload.get("counterpart", "") or ""),
+        classification_source=str(payload.get("classification_source", "") or ""),
+        category_confidence=payload.get("category_confidence"),
+        needs_review=bool(payload.get("needs_review", False)),
+        review_reason=str(payload.get("review_reason", "") or ""),
+        account_name=str(payload.get("account_name", "") or ""),
+        import_batch_id=str(payload.get("import_batch_id", "") or ""),
+        transfer_group_id=str(payload.get("transfer_group_id", "") or ""),
+        transfer_status=str(payload.get("transfer_status", TRANSFER_STATUS_NONE) or TRANSFER_STATUS_NONE),
+        excluded_from_spend=bool(payload.get("excluded_from_spend", False)),
     )
 
 
@@ -504,6 +656,13 @@ async def page_settings(request: Request):
     return templates.TemplateResponse(request, "settings.html", _template_context(request))
 
 
+@app.get("/review", response_class=HTMLResponse)
+async def page_review(request: Request):
+    if (redirect := _setup_redirect_if_needed(request)):
+        return redirect
+    return templates.TemplateResponse(request, "review.html", _template_context(request))
+
+
 @app.get("/subscriptions", response_class=HTMLResponse)
 async def page_subscriptions(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
@@ -555,9 +714,16 @@ async def api_summary(scope: str = Query("cycle")):
 
     with _get_db() as db:
         rows = db._conn.execute(
-            "SELECT date, clean_name, amount, category FROM tx_history ORDER BY date DESC"
+            """
+            SELECT date, clean_name, amount, category
+            FROM tx_history
+            WHERE excluded_from_spend = 0
+            ORDER BY date DESC
+            """
         ).fetchall()
         budget_limits = db.get_budget_limits()
+        needs_review_count = db.count_review_queue()
+        confirmed_internal_transfers_count = db.count_confirmed_transfer_groups()
 
     if not rows:
         return {
@@ -570,6 +736,8 @@ async def api_summary(scope: str = Query("cycle")):
             "has_data": False,
             "burn_rate": burn_rate,
             "insights": [],
+            "needs_review_count": needs_review_count,
+            "confirmed_internal_transfers_count": confirmed_internal_transfers_count,
         }
 
     from collections import Counter, defaultdict
@@ -671,6 +839,8 @@ async def api_summary(scope: str = Query("cycle")):
         "has_data": in_scope_count > 0,
         "burn_rate": burn_rate,
         "insights": insights,
+        "needs_review_count": needs_review_count,
+        "confirmed_internal_transfers_count": confirmed_internal_transfers_count,
     }
 
 
@@ -686,48 +856,65 @@ async def api_transactions(
     search: str = Query(""),
     date_from: str = Query(""),
     date_to: str = Query(""),
+    needs_review: bool | None = Query(None),
+    recurring: str = Query(""),
+    account_name: str = Query(""),
+    classification_source: str = Query(""),
+    transfer_status: str = Query(""),
 ):
     """Return paginated transactions from history."""
     with _get_db() as db:
-        query = "SELECT tx_id, date, clean_name, amount, category FROM tx_history ORDER BY date DESC"
-        rows = db._conn.execute(query).fetchall()
+        return db.list_transactions(
+            page=page,
+            per_page=per_page,
+            category=category,
+            uncategorized_only=uncategorized_only,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            needs_review=needs_review,
+            recurring=recurring,
+            account_name=account_name,
+            classification_source=classification_source,
+            transfer_status=transfer_status,
+        )
 
-    # Build result with categories
-    results = []
-    for tx_id, date, clean_name, amount, cat in rows:
 
-        # Filters
-        if category and cat.lower() != category.lower():
-            continue
-        if uncategorized_only and cat != "Uncategorized":
-            continue
-        if search and search.lower() not in clean_name.lower():
-            continue
-        if date_from and date < date_from:
-            continue
-        if date_to and date > date_to:
-            continue
+@app.get("/api/exports/transactions")
+async def api_export_transactions(
+    category: str = Query("", alias="category"),
+    uncategorized_only: bool = Query(False),
+    search: str = Query(""),
+    date_from: str = Query(""),
+    date_to: str = Query(""),
+    needs_review: bool | None = Query(None),
+    recurring: str = Query(""),
+    account_name: str = Query(""),
+    classification_source: str = Query(""),
+    transfer_status: str = Query(""),
+):
+    """Download the current transaction view as CSV."""
+    with _get_db() as db:
+        rows = db.list_all_transactions(
+            category=category,
+            uncategorized_only=uncategorized_only,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            needs_review=needs_review,
+            recurring=recurring,
+            account_name=account_name,
+            classification_source=classification_source,
+            transfer_status=transfer_status,
+        )
 
-        results.append({
-            "id": tx_id,
-            "date": date,
-            "merchant": clean_name,
-            "category": cat,
-            "amount": amount,
-        })
-
-    total = len(results)
-    start = (page - 1) * per_page
-    page_data = results[start : start + per_page]
-
-    return {
-        "transactions": page_data,
-        "total": total,
-        "uncategorized_total": sum(1 for tx in results if tx["category"] == "Uncategorized"),
-        "page": page,
-        "per_page": per_page,
-        "pages": max(1, (total + per_page - 1) // per_page),
-    }
+    csv_text = _transactions_to_csv(rows)
+    filename = f"spectra_transactions_{date.today().isoformat()}.csv"
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.patch("/api/transactions/{tx_id}")
@@ -739,34 +926,19 @@ async def api_update_transaction(tx_id: str, request: Request):
     apply_to_future = _coerce_bool(body.get("apply_to_future"), True)
 
     with _get_db() as db:
-        # Get current merchant name for this transaction
-        row = db._conn.execute(
-            "SELECT clean_name, original_description, category FROM tx_history WHERE tx_id = ?",
-            (tx_id,),
-        ).fetchone()
-
-        if not row:
+        tx = db.get_transaction(tx_id)
+        if not tx:
             return JSONResponse({"error": "Transaction not found"}, status_code=404)
 
-        old_name = row[0]
-        original_description = str(row[1] or "")
-        current_category = str(row[2] or "Uncategorized")
-        merchant_name = new_merchant or old_name
-        category_name = new_category or current_category
+        original_description = str(tx["original_description"] or "")
+        merchant_name = str(new_merchant or tx["merchant"])
+        category_name = str(new_category or tx["category"])
 
         if new_merchant:
-            db._conn.execute(
-                "UPDATE tx_history SET clean_name = ? WHERE tx_id = ?",
-                (merchant_name, tx_id),
-            )
+            db.update_transaction(tx_id, clean_name=merchant_name)
 
         if new_category:
-            # Also update the category directly on this transaction
-            db._conn.execute(
-                "UPDATE tx_history SET category = ? WHERE tx_id = ?",
-                (new_category, tx_id),
-            )
-        db._conn.commit()
+            db.update_transaction(tx_id, category=new_category)
 
         _persist_learning(
             db,
@@ -777,8 +949,9 @@ async def api_update_transaction(tx_id: str, request: Request):
             source="manual_edit",
             apply_to_future=apply_to_future,
         )
+        refreshed = _refresh_review_state(db, tx_id)
 
-    return {"ok": True, "id": tx_id}
+    return {"ok": True, "id": tx_id, "transaction": refreshed}
 
 
 @app.post("/api/transactions/bulk-category")
@@ -804,11 +977,7 @@ async def api_bulk_update_category(request: Request):
             f"SELECT tx_id, clean_name, original_description FROM tx_history WHERE tx_id IN ({placeholders})",
             cleaned_ids,
         ).fetchall()
-        db._conn.execute(
-            f"UPDATE tx_history SET category = ? WHERE tx_id IN ({placeholders})",
-            [category, *cleaned_ids],
-        )
-        db._conn.commit()
+        db.update_transactions(cleaned_ids, category=category)
 
         for tx_row_id, merchant_name, original_description in merchant_rows:
             _persist_learning(
@@ -820,8 +989,136 @@ async def api_bulk_update_category(request: Request):
                 source="bulk_edit",
                 apply_to_future=apply_to_future,
             )
+            _refresh_review_state(db, str(tx_row_id))
 
     return {"ok": True, "updated": len(cleaned_ids), "category": category}
+
+
+@app.get("/api/review")
+async def api_review(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=10, le=200),
+    reason: str = Query(""),
+    transfer_status: str = Query(""),
+    import_batch_id: str = Query(""),
+):
+    """Return review-queue items ordered by newest first."""
+    with _get_db() as db:
+        return db.get_review_queue(
+            page=page,
+            per_page=per_page,
+            reason=reason,
+            transfer_status=transfer_status,
+            import_batch_id=import_batch_id,
+        )
+
+
+@app.get("/api/exports/review")
+async def api_export_review(
+    reason: str = Query(""),
+    transfer_status: str = Query(""),
+    import_batch_id: str = Query(""),
+):
+    """Download the current review queue as CSV."""
+    with _get_db() as db:
+        rows = db.list_all_review_queue(
+            reason=reason,
+            transfer_status=transfer_status,
+            import_batch_id=import_batch_id,
+        )
+
+    csv_text = _transactions_to_csv(rows)
+    filename = f"spectra_review_queue_{date.today().isoformat()}.csv"
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.patch("/api/review/{tx_id}")
+async def api_review_transaction(tx_id: str, request: Request):
+    """Resolve or update a review-queue item."""
+    body = await request.json()
+    new_category = body.get("category")
+    new_merchant = body.get("merchant")
+    apply_to_future = _coerce_bool(body.get("apply_to_future"), False)
+    mark_reviewed = _coerce_bool(body.get("mark_reviewed"), False)
+
+    with _get_db() as db:
+        tx = db.get_transaction(tx_id)
+        if not tx:
+            return JSONResponse({"error": "Transaction not found"}, status_code=404)
+
+        merchant_name = str(new_merchant or tx["merchant"])
+        category_name = str(new_category or tx["category"])
+        updates: dict[str, Any] = {}
+        if new_merchant:
+            updates["clean_name"] = merchant_name
+        if new_category:
+            updates["category"] = category_name
+        if updates:
+            db.update_transaction(tx_id, **updates)
+
+        if new_merchant or new_category:
+            _persist_learning(
+                db,
+                tx_id=tx_id,
+                original_description=str(tx["original_description"] or ""),
+                clean_name=merchant_name,
+                category=category_name,
+                source="review_edit",
+                apply_to_future=apply_to_future,
+            )
+
+        refreshed = _refresh_review_state(db, tx_id)
+        if mark_reviewed and refreshed and refreshed["transfer_status"] != TRANSFER_STATUS_SUGGESTED:
+            db.update_transaction(tx_id, needs_review=0, review_reason="")
+            refreshed = db.get_transaction(tx_id)
+
+    return {"ok": True, "transaction": refreshed}
+
+
+@app.post("/api/transfers/confirm")
+async def api_confirm_transfer_group(request: Request):
+    """Confirm or dismiss a suggested transfer pair."""
+    body = await request.json()
+    transfer_group_id = str(body.get("transfer_group_id") or "").strip()
+    action = str(body.get("action") or "").strip().lower()
+
+    if not transfer_group_id:
+        return JSONResponse({"error": "transfer_group_id is required"}, status_code=400)
+    if action not in {"confirm", "dismiss"}:
+        return JSONResponse({"error": "action must be confirm or dismiss"}, status_code=400)
+
+    with _get_db() as db:
+        rows = db.get_transactions_by_transfer_group(transfer_group_id)
+        if not rows:
+            return JSONResponse({"error": "Transfer group not found"}, status_code=404)
+
+        tx_ids = [str(row["id"]) for row in rows]
+        if action == "confirm":
+            for row in rows:
+                db.update_transaction(
+                    str(row["id"]),
+                    category=_normalize_transfer_category(float(row["amount"])),
+                    transfer_status=TRANSFER_STATUS_CONFIRMED,
+                    excluded_from_spend=1,
+                    needs_review=0,
+                    review_reason="",
+                )
+        else:
+            for row in rows:
+                db.update_transaction(
+                    str(row["id"]),
+                    transfer_status=TRANSFER_STATUS_DISMISSED,
+                    excluded_from_spend=0,
+                )
+                _refresh_review_state(db, str(row["id"]))
+
+        updated_rows = [db.get_transaction(tx_id) for tx_id in tx_ids]
+
+    return {"ok": True, "transfer_group_id": transfer_group_id, "action": action, "transactions": updated_rows}
 
 
 # ── API: Categories ──────────────────────────────────────────────
@@ -1195,6 +1492,7 @@ async def api_upload(file: UploadFile = File(...)):
                 category_rules = db.get_category_rules()
                 merchant_db = db.get_merchant_categories()
                 training_data = db.get_training_data()
+                import_batch_id = build_import_batch_id()
 
             if not new_txns:
                 yield evt(100, "All transactions already imported", done=True,
@@ -1204,8 +1502,6 @@ async def api_upload(file: UploadFile = File(...)):
             n = len(new_txns)
 
             # ── Phase 4: categorise (25% → 92%, per transaction) ───
-            from spectra.ai import CategorisedTransaction
-
             # Pre-categorise from overrides (instant)
             pre_cat = []
             to_process = []
@@ -1220,6 +1516,10 @@ async def api_upload(file: UploadFile = File(...)):
                         clean_name=overrides[od]["clean_name"],
                         category=overrides[od]["category"],
                         amount=t.amount, currency=t.currency, date=t.date,
+                        counterpart=counterpart,
+                        classification_source="override",
+                        account_name=str(getattr(t, "account_name", "") or ""),
+                        import_batch_id=import_batch_id,
                     ))
                     override_count += 1
                     continue
@@ -1240,6 +1540,10 @@ async def api_upload(file: UploadFile = File(...)):
                         amount=t.amount,
                         currency=t.currency,
                         date=t.date,
+                        counterpart=counterpart,
+                        classification_source="rule",
+                        account_name=str(getattr(t, "account_name", "") or ""),
+                        import_batch_id=import_batch_id,
                     ))
                     rule_count += 1
                 else:
@@ -1256,8 +1560,10 @@ async def api_upload(file: UploadFile = File(...)):
             if to_process:
                 flat = [
                     {
+                        "id": t.id,
                         "raw_description": t.raw_description,
                         "counterpart": getattr(t, "counterpart", ""),
+                        "statement_category": getattr(t, "statement_category", ""),
                         "amount": t.amount,
                         "currency": t.currency,
                         "date": t.date,
@@ -1299,6 +1605,13 @@ async def api_upload(file: UploadFile = File(...)):
                                          base_currency=base_currency)
                     categorised.extend(results)
 
+            _enrich_categorised_transactions(
+                categorised,
+                source_transactions=new_txns,
+                import_batch_id=import_batch_id,
+                provider=settings.ai_provider,
+            )
+
             # ── Phase 5: recurring detection ───────────────────────
             yield evt(94, "Detecting recurring payments...")
             await asyncio.sleep(0)
@@ -1318,35 +1631,22 @@ async def api_upload(file: UploadFile = File(...)):
                     t.original_amount, t.original_currency = orig_amt, orig_cur
                     t.currency = base_currency
 
-            # ── Done ───────────────────────────────────────────────
-            preview = []
             for t in categorised:
-                row = {
-                    "id": t.id,
-                    "date": t.date,
-                    "merchant": t.clean_name,
-                    "category": t.category,
-                    "amount": t.amount,
-                    "currency": t.currency,
-                    "recurring": t.recurring,
-                    "original_description": t.original_description,
-                }
-                if getattr(t, "classification_source", ""):
-                    row["classification_source"] = t.classification_source
-                if getattr(t, "category_confidence", None) is not None:
-                    row["category_confidence"] = t.category_confidence
-                if getattr(t, "needs_review", False):
-                    row["needs_review"] = True
-                if getattr(t, "category_suggestions", None):
-                    row["category_suggestions"] = [
-                        suggestion.model_dump()
-                        if hasattr(suggestion, "model_dump")
-                        else dict(suggestion)
-                        for suggestion in t.category_suggestions
-                    ]
-                preview.append(row)
+                apply_review_state(t)
+
+            with _get_db() as db:
+                existing_transfer_candidates = _load_existing_transfer_candidates(db, categorised)
+            match_internal_transfers(categorised, existing_candidates=existing_transfer_candidates)
+
+            # ── Done ───────────────────────────────────────────────
+            preview = [_serialize_transaction_model(t) for t in categorised]
+            review_count = sum(1 for item in categorised if item.needs_review)
+            transfer_count = sum(1 for item in categorised if item.transfer_status == TRANSFER_STATUS_SUGGESTED)
             yield evt(100, f"{len(preview)} transactions ready", done=True,
-                      transactions=preview, message=f"{len(preview)} new transactions")
+                      transactions=preview,
+                      message=f"{len(preview)} new transactions",
+                      review_count=review_count,
+                      transfer_count=transfer_count)
 
         except Exception as e:
             logger.exception("Upload stream error: %s", e)
@@ -1378,19 +1678,19 @@ async def api_confirm(request: Request):
         base_currency = _resolve_base_currency(settings, db)
 
     with _get_db() as db:
-        from spectra.ai import CategorisedTransaction
-
-        cats = []
+        cats: list[CategorisedTransaction] = []
         future_mappings: dict[str, str] = {}
         future_overrides: dict[str, dict[str, str]] = {}
         learned_count = 0
+        if transactions and not transactions[0].get("import_batch_id"):
+            fallback_batch_id = build_import_batch_id()
+        else:
+            fallback_batch_id = ""
         for t in transactions:
-            ct = CategorisedTransaction(
-                id=t["id"], original_description=t.get("original_description", ""),
-                clean_name=t["merchant"], category=t["category"],
-                amount=t["amount"], currency=t.get("currency", base_currency),
-                date=t["date"], recurring=t.get("recurring", ""),
-            )
+            if fallback_batch_id and not t.get("import_batch_id"):
+                t["import_batch_id"] = fallback_batch_id
+            ct = _payload_to_transaction(t, base_currency=base_currency)
+            apply_review_state(ct)
             cats.append(ct)
 
             apply_to_future = _coerce_bool(t.get("apply_to_future"), True)
@@ -1412,9 +1712,20 @@ async def api_confirm(request: Request):
                     }
                 learned_count += 1
 
+        existing_transfer_candidates = _load_existing_transfer_candidates(db, cats)
+        existing_transfer_updates = match_internal_transfers(
+            cats,
+            existing_candidates=existing_transfer_candidates,
+        )
         db.save_history(cats)
+        for update in existing_transfer_updates:
+            tx_id = str(update.pop("tx_id"))
+            db.update_transaction(tx_id, **update)
         db.save_merchant_categories_batch(future_mappings)
         db.save_overrides(future_overrides)
+        review_count = sum(1 for tx in cats if tx.needs_review)
+        transfer_count = sum(1 for tx in cats if tx.transfer_status == TRANSFER_STATUS_SUGGESTED)
+        redirect_to = "/review" if review_count else "/transactions"
 
         # Optionally sync to Google Sheets
         if settings.spreadsheet_id and (settings.google_sheets_credentials_b64 or
@@ -1431,18 +1742,27 @@ async def api_confirm(request: Request):
                 refresh_dashboard(sheets)
                 return {
                     "ok": True,
-                    "message": f"Saved {len(cats)} transactions + synced to Sheets · learned {learned_count} future mapping(s)",
+                    "message": f"Saved {len(cats)} transactions + synced to Sheets · {review_count} need review · {transfer_count} transfer suggestion(s) · learned {learned_count} future mapping(s)",
+                    "review_count": review_count,
+                    "transfer_count": transfer_count,
+                    "redirect_to": redirect_to,
                 }
             except Exception as e:
                 logger.warning("Sheets sync failed: %s", e)
                 return {
                     "ok": True,
-                    "message": f"Saved {len(cats)} transactions · learned {learned_count} future mapping(s) (Sheets sync failed)",
+                    "message": f"Saved {len(cats)} transactions · {review_count} need review · {transfer_count} transfer suggestion(s) · learned {learned_count} future mapping(s) (Sheets sync failed)",
+                    "review_count": review_count,
+                    "transfer_count": transfer_count,
+                    "redirect_to": redirect_to,
                 }
 
     return {
         "ok": True,
-        "message": f"Saved {len(cats)} transactions to local DB · learned {learned_count} future mapping(s)",
+        "message": f"Saved {len(cats)} transactions to local DB · {review_count} need review · {transfer_count} transfer suggestion(s) · learned {learned_count} future mapping(s)",
+        "review_count": review_count,
+        "transfer_count": transfer_count,
+        "redirect_to": redirect_to,
     }
 
 
@@ -1479,7 +1799,7 @@ async def api_budget():
             """
             SELECT category, SUM(amount) as total
             FROM tx_history
-            WHERE amount < 0 AND date >= ? AND date < ?
+            WHERE amount < 0 AND excluded_from_spend = 0 AND date >= ? AND date < ?
             GROUP BY category
             """,
             (current_cycle["start"], current_cycle["end"]),
@@ -1491,7 +1811,7 @@ async def api_budget():
         all_cats = db._conn.execute(
             """
             SELECT DISTINCT category FROM tx_history
-            WHERE category != 'Uncategorized' AND amount < 0
+            WHERE category != 'Uncategorized' AND amount < 0 AND excluded_from_spend = 0
             ORDER BY category
             """
         ).fetchall()
@@ -1564,7 +1884,7 @@ async def api_trends():
 
     with _get_db() as db:
         rows = db._conn.execute(
-            "SELECT date, amount, category FROM tx_history ORDER BY date ASC"
+            "SELECT date, amount, category FROM tx_history WHERE excluded_from_spend = 0 ORDER BY date ASC"
         ).fetchall()
 
     if not rows:
@@ -1647,6 +1967,7 @@ async def api_subscriptions():
             """
             SELECT date, clean_name, amount, category, COALESCE(original_description, '')
             FROM tx_history
+            WHERE excluded_from_spend = 0
             ORDER BY date ASC
             """
         ).fetchall()

@@ -8,6 +8,7 @@
         <p class="page-subtitle" id="txSubtitle">Review, search, and fix merchants or categories directly from your ledger.</p>
     </div>
     <div class="page-header-actions">
+        <button class="btn btn-secondary btn-sm" type="button" onclick="exportTransactions()">Export CSV</button>
         <a href="/upload" class="btn btn-secondary btn-sm">Upload more</a>
     </div>
 </div>
@@ -18,6 +19,35 @@
         <select id="categoryFilter">
             <option value="">All categories</option>
         </select>
+        <select id="reviewFilter">
+            <option value="">Any review state</option>
+            <option value="needs_review">Needs review</option>
+            <option value="clean">Reviewed / clean</option>
+        </select>
+        <select id="recurringFilter">
+            <option value="">Any recurring state</option>
+            <option value="Subscription">Subscription</option>
+            <option value="Salary/Income">Salary / Income</option>
+        </select>
+        <select id="sourceFilter">
+            <option value="">Any source</option>
+            <option value="override">Override</option>
+            <option value="rule">Rule</option>
+            <option value="exact">Merchant memory</option>
+            <option value="fuzzy">Fuzzy match</option>
+            <option value="ml">ML</option>
+            <option value="hybrid">Keyword fallback</option>
+            <option value="fallback">Fallback</option>
+            <option value="openai">OpenAI</option>
+            <option value="gemini">Gemini</option>
+        </select>
+        <select id="transferFilter">
+            <option value="">Any transfer state</option>
+            <option value="suggested">Suggested transfer</option>
+            <option value="confirmed">Confirmed transfer</option>
+            <option value="dismissed">Dismissed transfer</option>
+        </select>
+        <input type="text" id="accountFilter" placeholder="Account..." style="max-width: 180px;">
         <input type="date" id="dateFrom" title="From date">
         <input type="date" id="dateTo" title="To date">
         <button class="btn btn-secondary btn-sm" type="button" onclick="resetTransactionFilters()">Reset filters</button>
@@ -65,11 +95,41 @@
         return window.SpectraTheme?.getCssVar(name, fallback) || fallback;
     }
 
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#39;');
+    }
+
     function categoryOptionsHtml(selected = '') {
         return categories.map(cat => {
             const isSelected = cat === selected ? 'selected' : '';
             return `<option value="${cat}" ${isSelected}>${cat}</option>`;
         }).join('');
+    }
+
+    function buildTransactionParams(includePagination = true) {
+        const filters = currentTransactionFilters();
+        const params = new URLSearchParams();
+        if (includePagination) {
+            params.set('page', String(currentPage));
+            params.set('per_page', '50');
+        }
+        if (filters.search) params.set('search', filters.search);
+        if (filters.category && !filters.uncategorizedOnly) params.set('category', filters.category);
+        if (filters.dateFrom) params.set('date_from', filters.dateFrom);
+        if (filters.dateTo) params.set('date_to', filters.dateTo);
+        if (filters.reviewState === 'needs_review') params.set('needs_review', 'true');
+        if (filters.reviewState === 'clean') params.set('needs_review', 'false');
+        if (filters.recurring) params.set('recurring', filters.recurring);
+        if (filters.source) params.set('classification_source', filters.source);
+        if (filters.transferStatus) params.set('transfer_status', filters.transferStatus);
+        if (filters.accountName) params.set('account_name', filters.accountName);
+        if (filters.uncategorizedOnly) params.set('uncategorized_only', 'true');
+        return params;
     }
 
     async function loadCategories() {
@@ -93,14 +153,7 @@
         await loadCurrency();
         currentPage = page;
         const filters = currentTransactionFilters();
-        const { search, category, dateFrom, dateTo } = filters;
-
-        const params = new URLSearchParams({ page, per_page: 50 });
-        if (search) params.set('search', search);
-        if (category && !uncategorizedOnly) params.set('category', category);
-        if (dateFrom) params.set('date_from', dateFrom);
-        if (dateTo) params.set('date_to', dateTo);
-        if (uncategorizedOnly) params.set('uncategorized_only', 'true');
+        const params = buildTransactionParams(true);
 
         const res = await fetch(`/api/transactions?${params}`);
         const data = await res.json();
@@ -122,12 +175,21 @@
         }
     }
 
+    function exportTransactions() {
+        window.location = `/api/exports/transactions?${buildTransactionParams(false)}`;
+    }
+
     function currentTransactionFilters() {
         return {
             search: document.getElementById('searchInput').value.trim(),
             category: document.getElementById('categoryFilter').value,
             dateFrom: document.getElementById('dateFrom').value,
             dateTo: document.getElementById('dateTo').value,
+            reviewState: document.getElementById('reviewFilter').value,
+            recurring: document.getElementById('recurringFilter').value,
+            source: document.getElementById('sourceFilter').value,
+            transferStatus: document.getElementById('transferFilter').value,
+            accountName: document.getElementById('accountFilter').value.trim(),
             uncategorizedOnly,
         };
     }
@@ -138,6 +200,11 @@
         if (filters.category && !filters.uncategorizedOnly) count += 1;
         if (filters.dateFrom) count += 1;
         if (filters.dateTo) count += 1;
+        if (filters.reviewState) count += 1;
+        if (filters.recurring) count += 1;
+        if (filters.source) count += 1;
+        if (filters.transferStatus) count += 1;
+        if (filters.accountName) count += 1;
         return count;
     }
 
@@ -171,6 +238,11 @@
         document.getElementById('categoryFilter').value = '';
         document.getElementById('dateFrom').value = '';
         document.getElementById('dateTo').value = '';
+        document.getElementById('reviewFilter').value = '';
+        document.getElementById('recurringFilter').value = '';
+        document.getElementById('sourceFilter').value = '';
+        document.getElementById('transferFilter').value = '';
+        document.getElementById('accountFilter').value = '';
         uncategorizedOnly = false;
         document.getElementById('uncatToggleBtn').textContent = 'Inbox zero: OFF';
         document.getElementById('categoryFilter').disabled = false;
@@ -210,6 +282,19 @@
             const isUncategorized = t.category === 'Uncategorized';
             const badgeClass = isUncategorized ? 'badge badge-uncategorized' : 'badge';
             const dotColor = isUncategorized ? '' : `background:${getCategoryColor(t.category)}`;
+            const extraBadges = [];
+            if (t.needs_review) {
+                extraBadges.push(`<span class="settings-badge warning tx-meta-badge">Review</span>`);
+            }
+            if (t.transfer_status && t.transfer_status !== 'none') {
+                extraBadges.push(`<span class="settings-badge tx-meta-badge">${escapeHtml(t.transfer_status)}</span>`);
+            }
+            if (t.classification_source) {
+                extraBadges.push(`<span class="settings-badge local tx-meta-badge">${escapeHtml(t.classification_source)}</span>`);
+            }
+            if (t.account_name) {
+                extraBadges.push(`<span class="settings-badge tx-meta-badge">${escapeHtml(t.account_name)}</span>`);
+            }
             const checkbox = isUncategorized
                 ? `<input type="checkbox" class="uncategorized-check" value="${t.id}" aria-label="Select transaction">`
                 : '';
@@ -227,6 +312,7 @@
             <td>${t.date}</td>
             <td>
                 <span class="editable" onclick="editField(this, '${t.id}', 'merchant')">${t.merchant}</span>
+                ${extraBadges.length ? `<div class="tx-meta-row">${extraBadges.join('')}</div>` : ''}
             </td>
             <td>
                 <span class="${badgeClass}" onclick="editField(this, '${t.id}', 'category')">
@@ -400,6 +486,14 @@
         searchTimeout = setTimeout(() => loadTransactions(1), 300);
     });
     document.getElementById('categoryFilter').addEventListener('change', () => loadTransactions(1));
+    document.getElementById('reviewFilter').addEventListener('change', () => loadTransactions(1));
+    document.getElementById('recurringFilter').addEventListener('change', () => loadTransactions(1));
+    document.getElementById('sourceFilter').addEventListener('change', () => loadTransactions(1));
+    document.getElementById('transferFilter').addEventListener('change', () => loadTransactions(1));
+    document.getElementById('accountFilter').addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(() => loadTransactions(1), 300);
+    });
     document.getElementById('dateFrom').addEventListener('change', () => loadTransactions(1));
     document.getElementById('dateTo').addEventListener('change', () => loadTransactions(1));
 

@@ -42,6 +42,7 @@ def seed_tx(
     amount: float,
     category: str,
     original_description: str,
+    **extra: object,
 ) -> None:
     db.save_history(
         [
@@ -52,6 +53,7 @@ def seed_tx(
                 amount=amount,
                 category=category,
                 original_description=original_description,
+                **extra,
             )
         ]
     )
@@ -473,6 +475,68 @@ def test_upload_preview_omits_local_review_metadata_for_cloud_mode(
     events = parse_sse_events(response.text)
     final_event = events[-1]
     preview_row = final_event["transactions"][0]
-    assert "classification_source" not in preview_row
-    assert "needs_review" not in preview_row
+    assert preview_row["classification_source"] == "openai"
+    assert preview_row["needs_review"] is False
     assert "category_suggestions" not in preview_row
+
+
+def test_review_queue_and_transfer_confirmation(client: TestClient, web_settings: Settings) -> None:
+    with BookmarkDB(web_settings.db_path) as db:
+        seed_tx(
+            db,
+            tx_id="tx-transfer-1",
+            tx_date="2026-03-17",
+            merchant="Bank A",
+            amount=-42.0,
+            category="Transfer",
+            original_description="BONIFICO VERSO BANK B",
+            transfer_group_id="xfer-1",
+            transfer_status="suggested",
+            needs_review=True,
+            review_reason="transfer_candidate",
+        )
+        seed_tx(
+            db,
+            tx_id="tx-transfer-2",
+            tx_date="2026-03-17",
+            merchant="Bank B",
+            amount=42.0,
+            category="Transfer In",
+            original_description="BONIFICO DA BANK A",
+            transfer_group_id="xfer-1",
+            transfer_status="suggested",
+            needs_review=True,
+            review_reason="transfer_candidate",
+        )
+
+    tx_export_response = client.get("/api/exports/transactions?transfer_status=suggested")
+    assert tx_export_response.status_code == 200
+    assert tx_export_response.headers["content-type"].startswith("text/csv")
+    assert "tx-transfer-1" in tx_export_response.text
+    assert "tx-transfer-2" in tx_export_response.text
+
+    review_export_response = client.get("/api/exports/review?transfer_status=suggested")
+    assert review_export_response.status_code == 200
+    assert review_export_response.headers["content-type"].startswith("text/csv")
+    assert "tx-transfer-1" in review_export_response.text
+    assert "tx-transfer-2" in review_export_response.text
+
+    review_response = client.get("/api/review")
+    assert review_response.status_code == 200
+    review = review_response.json()
+    assert review["total"] == 2
+    assert any(item["transfer_status"] == "suggested" for item in review["items"])
+
+    confirm_response = client.post(
+        "/api/transfers/confirm",
+        json={"transfer_group_id": "xfer-1", "action": "confirm"},
+    )
+    assert confirm_response.status_code == 200
+    payload = confirm_response.json()
+    assert payload["ok"] is True
+    assert len(payload["transactions"]) == 2
+
+    summary_response = client.get("/api/summary?scope=cycle")
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert summary["confirmed_internal_transfers_count"] >= 1

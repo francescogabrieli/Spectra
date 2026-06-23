@@ -74,6 +74,7 @@ class ParsedTransaction:
     original_amount: float | None = None
     original_currency: str | None = None
     counterpart: str = ""
+    account_name: str = ""
 
 
 def _normalize(s: str) -> str:

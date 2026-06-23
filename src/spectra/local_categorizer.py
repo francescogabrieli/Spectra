@@ -13,7 +13,7 @@ logger = logging.getLogger("spectra.local")
 
 # ── Adaptive ML confidence thresholds ───────────────────────────
 
-_DEFAULT_ML_THRESHOLD = 0.15
+_DEFAULT_ML_THRESHOLD = 0.20
 _DEFAULT_ML_MARGIN = 0.05
 _CATEGORY_ML_THRESHOLDS: dict[str, float] = {
     "Shopping": 0.22,
@@ -456,6 +456,7 @@ def categorise_local(
                 date=date,
                 statement_category=statement_category,
                 recurring=recurring,
+                counterpart=counterpart,
                 original_amount=None,
                 original_currency=None,
                 classification_source=classification_source,

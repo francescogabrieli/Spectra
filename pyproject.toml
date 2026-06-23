@@ -44,9 +44,13 @@ dependencies = [
     "tenacity>=8.0.0",
     "pypdf>=5.0.0",
     "httpx>=0.27.0",
-    "pytest>=9.0.2",
     "ofxparse2>=0.2.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/francescogabrieli/Spectra"
+Repository = "https://github.com/francescogabrieli/Spectra"
+Documentation = "https://github.com/francescogabrieli/Spectra/tree/main/docs"
 
 [project.optional-dependencies]
 dev = [
@@ -66,3 +70,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

@@ -38,6 +38,14 @@
         <div class="card-label">Uncategorized (All)</div>
         <div class="card-value warning" id="uncategorized">—</div>
     </div>
+    <a href="/review" class="card card-link">
+        <div class="card-label">Needs Review</div>
+        <div class="card-value warning" id="needsReviewCount">—</div>
+    </a>
+    <a href="/transactions?transfer_status=confirmed" class="card card-link">
+        <div class="card-label">Confirmed Transfers</div>
+        <div class="card-value neutral" id="confirmedTransfersCount">—</div>
+    </a>
 </div>
 
 <div class="burn-rate" id="burnRateBox" style="display:none;">
@@ -349,6 +357,8 @@
                 ? data.uncategorized_total
                 : data.uncategorized;
             document.getElementById('uncategorized').textContent = uncategorizedValue;
+            document.getElementById('needsReviewCount').textContent = Number(data.needs_review_count || 0).toLocaleString();
+            document.getElementById('confirmedTransfersCount').textContent = Number(data.confirmed_internal_transfers_count || 0).toLocaleString();
 
             document.getElementById('subtitle').textContent = data.scope_label || data.current_cycle?.label || 'Selected period';
             renderBurnRate(data);

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.png" alt="Spectra" width="180" />
+  <img src="docs/assets/icon.png" alt="Spectra" width="180" />
 </p>
 
 <h1 align="center">Spectra</h1>
@@ -16,15 +16,22 @@
   <img src="https://img.shields.io/github/stars/francescogabrieli/Spectra?style=social" alt="GitHub stars" />
 </p>
 
+<p align="center">
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="docs/repository-layout.md">Repository Layout</a> ·
+  <a href="docs/roadmap.md">Roadmap</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
 ## Screenshots
 
 | Dashboard | Transactions |
 |---|---|
-| ![Spectra Dashboard Overview](assets/Screenshot%202026-03-04%20alle%2016.22.41.png) | ![Spectra Transactions Page](assets/Screenshot%202026-03-04%20alle%2016.23.24.png) |
+| ![Spectra Dashboard Overview](docs/assets/dashboard-overview.png) | ![Spectra Transactions Page](docs/assets/transactions-page.png) |
 
 | Budget | Trends |
 |---|---|
-| ![Spectra Budget Page](assets/Screenshot%202026-03-04%20alle%2016.23.42.png) | ![Spectra Trends Page](assets/Screenshot%202026-03-04%20alle%2016.24.01.png) |
+| ![Spectra Budget Page](docs/assets/budget-page.png) | ![Spectra Trends Page](docs/assets/trends-page.png) |
 
 ---
 
@@ -93,6 +100,17 @@ If enabled, Spectra can also push data to a Google Sheet:
 - **Actionable insights** — Burn-rate risk, subscription tracking, price changes, anomalies, and cycle-over-cycle change detection surfaced in the dashboard
 - **Idempotent** — Transaction hashes in SQLite prevent duplicate imports
 - **Automation-ready** — Can run on a schedule (for example via cron)
+
+---
+
+## Repository structure
+
+- `src/spectra/` — application code, pipeline, local classifier, and FastAPI web app
+- `tests/` — automated tests
+- `docs/` — architecture, roadmap, and maintenance documentation
+- `scripts/launchers/` — implementation for the cross-platform launchers
+- `tools/dev/` — developer playground scripts and one-off utilities
+- `data/`, `inbox/`, `processed/` — local runtime state kept outside version control
 
 ---
 
@@ -287,7 +305,7 @@ To let Spectra write to your Google Sheet, you need a Google Cloud **Service Acc
 1. Go to Google Cloud Console
 2. Create a project and enable **Google Sheets API** and **Google Drive API**
 3. Create a **Service Account** and download the JSON key
-4. Save it as `credentials.json` in the project root
+4. Save it as `credentials.json` in the project root, or point `GOOGLE_SHEETS_CREDENTIALS_FILE` to a custom path such as `secrets/credentials.json`
 5. Share your Google Sheet with the service account email (Editor)
 6. Put the Sheet ID into `SPREADSHEET_ID` in your `.env`
 

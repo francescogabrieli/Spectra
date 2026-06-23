@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("spectra.db")
 
@@ -21,7 +22,20 @@ CREATE TABLE IF NOT EXISTS tx_history (
     clean_name  TEXT NOT NULL,
     amount      REAL NOT NULL,
     category    TEXT NOT NULL DEFAULT 'Uncategorized',
-    original_description TEXT NOT NULL DEFAULT ''
+    original_description TEXT NOT NULL DEFAULT '',
+    counterpart TEXT NOT NULL DEFAULT '',
+    recurring TEXT NOT NULL DEFAULT '',
+    classification_source TEXT NOT NULL DEFAULT '',
+    category_confidence REAL,
+    needs_review INTEGER NOT NULL DEFAULT 0,
+    review_reason TEXT NOT NULL DEFAULT '',
+    account_name TEXT NOT NULL DEFAULT '',
+    import_batch_id TEXT NOT NULL DEFAULT '',
+    transfer_group_id TEXT NOT NULL DEFAULT '',
+    transfer_status TEXT NOT NULL DEFAULT 'none',
+    excluded_from_spend INTEGER NOT NULL DEFAULT 0,
+    original_amount REAL,
+    original_currency TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_overrides (
@@ -67,6 +81,46 @@ CREATE TABLE IF NOT EXISTS learning_feedback (
 );
 """
 
+_TX_HISTORY_COLUMN_DEFS: dict[str, str] = {
+    "category": "TEXT NOT NULL DEFAULT 'Uncategorized'",
+    "original_description": "TEXT NOT NULL DEFAULT ''",
+    "counterpart": "TEXT NOT NULL DEFAULT ''",
+    "recurring": "TEXT NOT NULL DEFAULT ''",
+    "classification_source": "TEXT NOT NULL DEFAULT ''",
+    "category_confidence": "REAL",
+    "needs_review": "INTEGER NOT NULL DEFAULT 0",
+    "review_reason": "TEXT NOT NULL DEFAULT ''",
+    "account_name": "TEXT NOT NULL DEFAULT ''",
+    "import_batch_id": "TEXT NOT NULL DEFAULT ''",
+    "transfer_group_id": "TEXT NOT NULL DEFAULT ''",
+    "transfer_status": "TEXT NOT NULL DEFAULT 'none'",
+    "excluded_from_spend": "INTEGER NOT NULL DEFAULT 0",
+    "original_amount": "REAL",
+    "original_currency": "TEXT",
+}
+
+_TX_HISTORY_SELECT_COLUMNS = """
+tx_id,
+date,
+clean_name,
+amount,
+category,
+original_description,
+counterpart,
+recurring,
+classification_source,
+category_confidence,
+needs_review,
+review_reason,
+account_name,
+import_batch_id,
+transfer_group_id,
+transfer_status,
+excluded_from_spend,
+original_amount,
+original_currency
+"""
+
 
 class BookmarkDB:
     """Thin wrapper around a SQLite database for dedup tracking."""
@@ -82,18 +136,14 @@ class BookmarkDB:
 
     def _migrate(self) -> None:
         """Apply backwards-compatible schema migrations."""
-        # Add category column to existing tx_history tables
-        try:
-            self._conn.execute("ALTER TABLE tx_history ADD COLUMN category TEXT NOT NULL DEFAULT 'Uncategorized'")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        # Add original_description column to tx_history (for ML training on raw text)
-        try:
-            self._conn.execute("ALTER TABLE tx_history ADD COLUMN original_description TEXT NOT NULL DEFAULT ''")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        existing_columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(tx_history)").fetchall()
+        }
+        for column, definition in _TX_HISTORY_COLUMN_DEFS.items():
+            if column in existing_columns:
+                continue
+            self._conn.execute(f"ALTER TABLE tx_history ADD COLUMN {column} {definition}")
         # budget_limits table (for existing DBs pre-budget feature)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS budget_limits (
@@ -130,7 +180,41 @@ class BookmarkDB:
                 created_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tx_history_date_desc ON tx_history(date DESC);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_category ON tx_history(category);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_needs_review ON tx_history(needs_review, date DESC);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_account_name ON tx_history(account_name);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_transfer_status ON tx_history(transfer_status);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_import_batch ON tx_history(import_batch_id);
+            """
+        )
         self._conn.commit()
+
+    @staticmethod
+    def _row_to_transaction(row: tuple[Any, ...]) -> dict[str, Any]:
+        return {
+            "id": str(row[0]),
+            "date": str(row[1]),
+            "merchant": str(row[2]),
+            "amount": float(row[3]),
+            "category": str(row[4]),
+            "original_description": str(row[5] or ""),
+            "counterpart": str(row[6] or ""),
+            "recurring": str(row[7] or ""),
+            "classification_source": str(row[8] or ""),
+            "category_confidence": float(row[9]) if row[9] is not None else None,
+            "needs_review": bool(row[10]),
+            "review_reason": str(row[11] or ""),
+            "account_name": str(row[12] or ""),
+            "import_batch_id": str(row[13] or ""),
+            "transfer_group_id": str(row[14] or ""),
+            "transfer_status": str(row[15] or "none"),
+            "excluded_from_spend": bool(row[16]),
+            "original_amount": float(row[17]) if row[17] is not None else None,
+            "original_currency": str(row[18] or "") or None,
+        }
 
     # ── Transaction dedup ────────────────────────────────────────
 
@@ -169,26 +253,62 @@ class BookmarkDB:
         self._conn.commit()
 
     # ── History tracking for Recurring Detection ─────────────────
-    
+
     def save_history(self, transactions: list[Any]) -> None:
         """Save a batch of parsed and ML-categorised transactions to history."""
         self._conn.executemany(
             """
-            INSERT OR REPLACE INTO tx_history (tx_id, date, clean_name, amount, category, original_description)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO tx_history (
+                tx_id,
+                date,
+                clean_name,
+                amount,
+                category,
+                original_description,
+                counterpart,
+                recurring,
+                classification_source,
+                category_confidence,
+                needs_review,
+                review_reason,
+                account_name,
+                import_batch_id,
+                transfer_group_id,
+                transfer_status,
+                excluded_from_spend,
+                original_amount,
+                original_currency
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
-                    t.id, t.date, t.clean_name, t.amount,
-                    getattr(t, 'category', 'Uncategorized'),
-                    getattr(t, 'original_description', ''),
+                    t.id,
+                    t.date,
+                    t.clean_name,
+                    t.amount,
+                    getattr(t, "category", "Uncategorized"),
+                    getattr(t, "original_description", ""),
+                    getattr(t, "counterpart", ""),
+                    getattr(t, "recurring", ""),
+                    getattr(t, "classification_source", ""),
+                    getattr(t, "category_confidence", None),
+                    1 if getattr(t, "needs_review", False) else 0,
+                    getattr(t, "review_reason", ""),
+                    getattr(t, "account_name", ""),
+                    getattr(t, "import_batch_id", ""),
+                    getattr(t, "transfer_group_id", ""),
+                    getattr(t, "transfer_status", "none") or "none",
+                    1 if getattr(t, "excluded_from_spend", False) else 0,
+                    getattr(t, "original_amount", None),
+                    getattr(t, "original_currency", None),
                 )
                 for t in transactions
             ],
         )
         # Also mark them as seen
         self.mark_seen_batch([t.id for t in transactions])
-        
+
     def get_merchant_history(self) -> dict[str, list[tuple[str, float]]]:
         """Fetch all historical transactions grouped by merchant clean_name."""
         rows = self._conn.execute(
@@ -202,8 +322,312 @@ class BookmarkDB:
         history: dict[str, list[tuple[str, float]]] = {}
         for clean_name, date, amount in rows:
             history.setdefault(clean_name, []).append((date, amount))
-            
+
         return history
+
+    def list_transactions(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 50,
+        category: str = "",
+        uncategorized_only: bool = False,
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        needs_review: bool | None = None,
+        recurring: str = "",
+        account_name: str = "",
+        classification_source: str = "",
+        transfer_status: str = "",
+    ) -> dict[str, Any]:
+        """Return paginated transaction results with SQL-backed filtering."""
+        where: list[str] = []
+        params: list[Any] = []
+
+        if category:
+            where.append("LOWER(category) = LOWER(?)")
+            params.append(category)
+        if uncategorized_only:
+            where.append("category = 'Uncategorized'")
+        if search:
+            where.append(
+                "(LOWER(clean_name) LIKE ? OR LOWER(COALESCE(original_description, '')) LIKE ? OR LOWER(COALESCE(counterpart, '')) LIKE ?)"
+            )
+            like = f"%{search.lower()}%"
+            params.extend([like, like, like])
+        if date_from:
+            where.append("date >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append("date <= ?")
+            params.append(date_to)
+        if needs_review is not None:
+            where.append("needs_review = ?")
+            params.append(1 if needs_review else 0)
+        if recurring:
+            where.append("recurring = ?")
+            params.append(recurring)
+        if account_name:
+            where.append("LOWER(account_name) = LOWER(?)")
+            params.append(account_name)
+        if classification_source:
+            where.append("LOWER(classification_source) = LOWER(?)")
+            params.append(classification_source)
+        if transfer_status:
+            where.append("transfer_status = ?")
+            params.append(transfer_status)
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        total_row = self._conn.execute(
+            f"SELECT COUNT(*) FROM tx_history {where_sql}",
+            params,
+        ).fetchone()
+        total = int(total_row[0] if total_row else 0)
+
+        uncategorized_where = list(where)
+        uncategorized_where.append("category = 'Uncategorized'")
+        uncategorized_row = self._conn.execute(
+            f"SELECT COUNT(*) FROM tx_history WHERE {' AND '.join(uncategorized_where)}",
+            params,
+        ).fetchone()
+        uncategorized_total = int(uncategorized_row[0] if uncategorized_row else 0)
+
+        offset = max(page - 1, 0) * per_page
+        rows = self._conn.execute(
+            f"""
+            SELECT {_TX_HISTORY_SELECT_COLUMNS}
+            FROM tx_history
+            {where_sql}
+            ORDER BY date DESC, tx_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+
+        transactions = [self._row_to_transaction(row) for row in rows]
+        return {
+            "transactions": transactions,
+            "total": total,
+            "uncategorized_total": uncategorized_total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, (total + per_page - 1) // per_page),
+        }
+
+    def list_all_transactions(
+        self,
+        *,
+        category: str = "",
+        uncategorized_only: bool = False,
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        needs_review: bool | None = None,
+        recurring: str = "",
+        account_name: str = "",
+        classification_source: str = "",
+        transfer_status: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return every transaction matching the provided filters."""
+        first_page = self.list_transactions(
+            page=1,
+            per_page=1,
+            category=category,
+            uncategorized_only=uncategorized_only,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            needs_review=needs_review,
+            recurring=recurring,
+            account_name=account_name,
+            classification_source=classification_source,
+            transfer_status=transfer_status,
+        )
+        total = int(first_page["total"])
+        if total == 0:
+            return []
+        return self.list_transactions(
+            page=1,
+            per_page=total,
+            category=category,
+            uncategorized_only=uncategorized_only,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            needs_review=needs_review,
+            recurring=recurring,
+            account_name=account_name,
+            classification_source=classification_source,
+            transfer_status=transfer_status,
+        )["transactions"]
+
+    def get_review_queue(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 50,
+        reason: str = "",
+        transfer_status: str = "",
+        import_batch_id: str = "",
+    ) -> dict[str, Any]:
+        """Return paginated transactions that still need review."""
+        where = ["needs_review = 1"]
+        params: list[Any] = []
+
+        if reason:
+            where.append("review_reason = ?")
+            params.append(reason)
+        if transfer_status:
+            where.append("transfer_status = ?")
+            params.append(transfer_status)
+        if import_batch_id:
+            where.append("import_batch_id = ?")
+            params.append(import_batch_id)
+
+        where_sql = f"WHERE {' AND '.join(where)}"
+        total_row = self._conn.execute(
+            f"SELECT COUNT(*) FROM tx_history {where_sql}",
+            params,
+        ).fetchone()
+        total = int(total_row[0] if total_row else 0)
+        offset = max(page - 1, 0) * per_page
+        rows = self._conn.execute(
+            f"""
+            SELECT {_TX_HISTORY_SELECT_COLUMNS}
+            FROM tx_history
+            {where_sql}
+            ORDER BY date DESC, tx_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+        items = [self._row_to_transaction(row) for row in rows]
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, (total + per_page - 1) // per_page),
+        }
+
+    def list_all_review_queue(
+        self,
+        *,
+        reason: str = "",
+        transfer_status: str = "",
+        import_batch_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return every item that currently needs review."""
+        first_page = self.get_review_queue(
+            page=1,
+            per_page=1,
+            reason=reason,
+            transfer_status=transfer_status,
+            import_batch_id=import_batch_id,
+        )
+        total = int(first_page["total"])
+        if total == 0:
+            return []
+        return self.get_review_queue(
+            page=1,
+            per_page=total,
+            reason=reason,
+            transfer_status=transfer_status,
+            import_batch_id=import_batch_id,
+        )["items"]
+
+    def get_transaction(self, tx_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            f"SELECT {_TX_HISTORY_SELECT_COLUMNS} FROM tx_history WHERE tx_id = ?",
+            (tx_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_to_transaction(row)
+
+    def get_transactions_by_transfer_group(self, transfer_group_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            f"""
+            SELECT {_TX_HISTORY_SELECT_COLUMNS}
+            FROM tx_history
+            WHERE transfer_group_id = ?
+            ORDER BY date DESC, tx_id DESC
+            """,
+            (transfer_group_id,),
+        ).fetchall()
+        return [self._row_to_transaction(row) for row in rows]
+
+    def update_transaction(self, tx_id: str, **fields: Any) -> bool:
+        """Update a single transaction row."""
+        updates = {key: value for key, value in fields.items() if value is not None}
+        if not updates:
+            return False
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        params = list(updates.values()) + [tx_id]
+        cur = self._conn.execute(
+            f"UPDATE tx_history SET {assignments} WHERE tx_id = ?",
+            params,
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def update_transactions(self, tx_ids: list[str], **fields: Any) -> int:
+        """Update multiple transactions in one statement."""
+        cleaned_ids = [str(tx_id) for tx_id in tx_ids if str(tx_id)]
+        updates = {key: value for key, value in fields.items() if value is not None}
+        if not cleaned_ids or not updates:
+            return 0
+
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        placeholders = ",".join("?" for _ in cleaned_ids)
+        params = list(updates.values()) + cleaned_ids
+        cur = self._conn.execute(
+            f"UPDATE tx_history SET {assignments} WHERE tx_id IN ({placeholders})",
+            params,
+        )
+        self._conn.commit()
+        return int(cur.rowcount)
+
+    def find_transfer_candidates(
+        self,
+        *,
+        tx_date: str,
+        amount: float,
+        exclude_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return nearby same-amount rows that could form a transfer pair."""
+        from datetime import datetime, timedelta
+
+        exclude_ids = exclude_ids or []
+        ref_date = datetime.strptime(tx_date, "%Y-%m-%d").date()
+        date_from = (ref_date - timedelta(days=3)).isoformat()
+        date_to = (ref_date + timedelta(days=3)).isoformat()
+
+        where = [
+            "date >= ?",
+            "date <= ?",
+            "ABS(ABS(amount) - ?) <= 0.01",
+            "transfer_status NOT IN ('confirmed', 'dismissed')",
+            "excluded_from_spend = 0",
+        ]
+        params: list[Any] = [date_from, date_to, abs(amount)]
+        if exclude_ids:
+            placeholders = ",".join("?" for _ in exclude_ids)
+            where.append(f"tx_id NOT IN ({placeholders})")
+            params.extend(exclude_ids)
+
+        rows = self._conn.execute(
+            f"""
+            SELECT {_TX_HISTORY_SELECT_COLUMNS}
+            FROM tx_history
+            WHERE {' AND '.join(where)}
+            ORDER BY date DESC, tx_id DESC
+            """,
+            params,
+        ).fetchall()
+        return [self._row_to_transaction(row) for row in rows]
 
     # ── Merchant Categories (for local mode) ──────────────────────
 
@@ -630,6 +1054,22 @@ class BookmarkDB:
             "rule_updates": rule_updates,
             "merchant_updates": merchant_updates,
         }
+
+    def count_review_queue(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM tx_history WHERE needs_review = 1"
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def count_confirmed_transfer_groups(self) -> int:
+        row = self._conn.execute(
+            """
+            SELECT COUNT(DISTINCT transfer_group_id)
+            FROM tx_history
+            WHERE transfer_status = 'confirmed' AND transfer_group_id != ''
+            """
+        ).fetchone()
+        return int(row[0] if row else 0)
 
     def count(self) -> int:
         """Return total number of seen transactions."""
