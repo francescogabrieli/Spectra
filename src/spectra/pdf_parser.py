@@ -236,6 +236,10 @@ def _chunk_transaction_lines(lines: list[str]) -> list[str]:
             continue
 
         if current:
+            existing = " ".join(current)
+            if _BANK_TX_PATTERN.match(existing) or _TX_PATTERN.match(existing):
+                # Ignore footer/header noise once the transaction line is already complete.
+                continue
             current.append(line)
 
     if current:

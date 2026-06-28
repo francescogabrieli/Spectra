@@ -107,6 +107,11 @@ def test_first_run_requires_currency_setup_redirect(client: TestClient) -> None:
     assert response.headers["location"] == "/settings?setup=currency"
 
 
+def test_settings_page_does_not_redirect_during_first_run(client: TestClient) -> None:
+    response = client.get("/settings?setup=currency", follow_redirects=False)
+    assert response.status_code == 200
+
+
 def test_base_currency_can_be_set_via_preferences(client: TestClient, web_settings: Settings) -> None:
     response = client.patch(
         "/api/settings/preferences",
@@ -120,6 +125,88 @@ def test_base_currency_can_be_set_via_preferences(client: TestClient, web_settin
 
     with BookmarkDB(web_settings.db_path) as db:
         assert db.get_app_setting("base_currency") == "USD"
+
+
+def test_api_settings_exposes_setup_status_for_empty_database(
+    client: TestClient,
+) -> None:
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["is_first_run"] is True
+    assert payload["requires_base_currency_setup"] is True
+    assert payload["provider"] == "local"
+    assert payload["provider_ready"] is True
+    assert payload["has_existing_transactions"] is False
+    assert payload["google_sheets_configured"] is False
+    assert payload["setup_status"]["steps"][0]["id"] == "base_currency"
+
+
+def test_api_settings_exposes_setup_status_for_populated_database(
+    client: TestClient,
+    web_settings: Settings,
+) -> None:
+    with BookmarkDB(web_settings.db_path) as db:
+        db.set_app_setting("base_currency", "EUR")
+        seed_tx(
+            db,
+            tx_id="tx-existing",
+            tx_date="2026-03-10",
+            merchant="Netflix",
+            amount=-12.99,
+            category="Digital Subscriptions",
+            original_description="NETFLIX.COM",
+        )
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["is_first_run"] is False
+    assert payload["requires_base_currency_setup"] is False
+    assert payload["has_existing_transactions"] is True
+
+
+def test_upload_is_blocked_until_base_currency_is_saved(client: TestClient) -> None:
+    response = client.post(
+        "/api/upload",
+        files={"file": ("test.csv", b"Date,Description,Amount\n2026-02-22,STARBUCKS,-4.50\n", "text/csv")},
+    )
+    assert response.status_code == 400
+    assert response.json()["requires_base_currency_setup"] is True
+    assert "save your base currency before importing" in response.json()["error"]
+
+
+def test_confirm_is_blocked_until_base_currency_is_saved(client: TestClient) -> None:
+    response = client.post(
+        "/api/confirm",
+        json={"transactions": [{"id": "tx-1", "date": "2026-02-22", "merchant": "STARBUCKS", "amount": -4.5}]},
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["requires_base_currency_setup"] is True
+    assert payload["error"] == payload["message"]
+
+
+def test_upload_proceeds_after_first_run_setup(client: TestClient) -> None:
+    save_response = client.patch("/api/settings/preferences", json={"base_currency": "EUR"})
+    assert save_response.status_code == 200
+
+    response = client.post(
+        "/api/upload",
+        files={"file": ("test.csv", b"Date,Description,Amount\n2026-02-22,STARBUCKS,-4.50\n", "text/csv")},
+    )
+    assert response.status_code == 200
+
+    events = parse_sse_events(response.text)
+    assert events[-1]["done"] is True
+    assert events[-1]["transactions"]
+
+
+def test_pages_stop_redirecting_after_base_currency_setup(client: TestClient) -> None:
+    client.patch("/api/settings/preferences", json={"base_currency": "EUR"})
+    response = client.get("/upload", follow_redirects=False)
+    assert response.status_code == 200
 
 
 def test_cycle_mode_can_be_set_to_last_business_day(client: TestClient, web_settings: Settings) -> None:

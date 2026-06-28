@@ -51,18 +51,23 @@
     <div class="settings-section-head">
         <div>
             <div class="settings-section-eyebrow">Recommended first</div>
-            <h2>Setup & Preferences</h2>
-            <p>These defaults shape how Spectra feels every day, so they should be easy to verify at a glance.</p>
+            <h2>First-Time Setup & Preferences</h2>
+            <p>Finish the required first-run steps once, then use the rest of Settings for preferences, learning, and optional integrations.</p>
         </div>
     </div>
 
-    <div class="settings-group settings-danger-zone" id="currencySetupNotice" style="display:none;">
-        <h3>Action Required</h3>
-        <div class="settings-row">
-            <div class="settings-label">
-                Set your Base Currency
-                <small>First-time setup: choose the base currency before using the app.</small>
+    <div class="settings-group" id="setupChecklistGroup">
+        <h3>First-Time Setup Checklist</h3>
+        <p class="settings-group-copy">Required before import: save your base currency. Optional later: Google Sheets sync. Spectra will keep redirecting first-run traffic here until the required setup is complete.</p>
+        <div class="settings-checklist" id="setupChecklist">
+            <div class="empty-state" style="padding: 18px; margin-top: 8px;">
+                <p>Loading setup checklist...</p>
             </div>
+        </div>
+        <div class="settings-cta-row">
+            <button class="btn btn-primary" id="setupSaveCurrencyBtn" type="button" onclick="saveBaseCurrency()">Save base currency</button>
+            <a href="/upload" class="btn btn-success" id="setupContinueBtn" aria-disabled="true">Continue to upload</a>
+            <a href="/upload" class="btn btn-secondary" id="skipOptionalBtn">Skip optional integrations</a>
         </div>
     </div>
 
@@ -71,7 +76,7 @@
         <div class="settings-row">
             <div class="settings-label">
                 Base Currency
-                <small>All amounts are normalized to this currency using ECB rates.</small>
+                <small>Required before import. All amounts are normalized to this currency using ECB rates.</small>
             </div>
             <div class="settings-control-group">
                 <select class="settings-select" id="baseCurrencySelect">
@@ -86,7 +91,7 @@
                     <option value="NOK">NOK</option>
                     <option value="DKK">DKK</option>
                 </select>
-                <button class="btn btn-primary btn-sm" id="saveCurrencyBtn" type="button" onclick="saveBaseCurrency()">Save</button>
+                <button class="btn btn-primary btn-sm" id="saveCurrencyBtn" type="button" onclick="saveBaseCurrency()">Save base currency</button>
                 <span class="settings-badge" id="currencySetupBadge" style="display:none;">Required</span>
             </div>
         </div>
@@ -250,7 +255,7 @@
         </div>
     </div>
 
-    <div class="settings-group">
+    <div class="settings-group" id="settings-provider">
         <h3>AI Provider</h3>
         <div class="settings-row">
             <div class="settings-label">
@@ -365,8 +370,75 @@
         return `Fixed day · ${day}${ordSuffix(day)}`;
     }
 
+    function setupStatusBadgeClass(status) {
+        switch (status) {
+            case 'complete':
+            case 'ready':
+                return 'settings-badge local';
+            case 'required':
+            case 'blocked':
+            case 'attention':
+                return 'settings-badge warning';
+            default:
+                return 'settings-badge';
+        }
+    }
+
+    function setupStatusLabel(status) {
+        switch (status) {
+            case 'complete':
+                return 'Complete';
+            case 'ready':
+                return 'Ready';
+            case 'required':
+                return 'Required';
+            case 'blocked':
+                return 'Blocked';
+            case 'attention':
+                return 'Attention';
+            default:
+                return 'Optional';
+        }
+    }
+
+    function renderSetupChecklist(settings) {
+        const setup = settings.setup_status || settings;
+        const checklist = document.getElementById('setupChecklist');
+        const continueBtn = document.getElementById('setupContinueBtn');
+        const skipOptionalBtn = document.getElementById('skipOptionalBtn');
+
+        if (checklist && Array.isArray(setup.steps)) {
+            checklist.innerHTML = setup.steps.map((step, index) => `
+                <div class="settings-checklist-item">
+                    <div class="settings-checklist-step">${index + 1}</div>
+                    <div class="settings-checklist-copy">
+                        <strong>${escapeHtml(step.label)}</strong>
+                        <p>${escapeHtml(step.detail)}</p>
+                    </div>
+                    <div class="settings-checklist-actions">
+                        <span class="${setupStatusBadgeClass(step.status)}">${setupStatusLabel(step.status)}</span>
+                        <a class="settings-overview-link" href="${escapeHtml(step.action_href)}">${escapeHtml(step.action_label)}</a>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        if (continueBtn) {
+            const canStartImport = Boolean(setup.can_start_import);
+            continueBtn.setAttribute('href', canStartImport ? '/upload' : '#settings-currency');
+            continueBtn.setAttribute('aria-disabled', canStartImport ? 'false' : 'true');
+            continueBtn.classList.toggle('is-disabled', !canStartImport);
+        }
+
+        if (skipOptionalBtn) {
+            skipOptionalBtn.setAttribute('href', Boolean(setup.can_start_import) ? '/upload' : '#settings-provider');
+        }
+    }
+
     function updateSettingsOverview(settings) {
-        const requiresCurrencySetup = Boolean(settings.requires_base_currency_setup);
+        const setup = settings.setup_status || settings;
+        const requiresCurrencySetup = Boolean(setup.requires_base_currency_setup);
+        const isFirstRun = Boolean(setup.is_first_run);
         const setupCard = document.getElementById('setupStatusCard');
         const setupValue = document.getElementById('setupStatusValue');
         const setupHint = document.getElementById('setupStatusHint');
@@ -382,16 +454,22 @@
             setupCard.classList.toggle('is-warning', requiresCurrencySetup);
         }
         if (setupValue) {
-            setupValue.textContent = requiresCurrencySetup ? 'Action required' : 'Ready';
+            setupValue.textContent = requiresCurrencySetup
+                ? 'Action required'
+                : (isFirstRun ? 'Ready to import' : 'Configured');
         }
         if (setupHint) {
             setupHint.textContent = requiresCurrencySetup
-                ? 'Choose a base currency before using Spectra normally.'
-                : 'Core preferences are configured and ready to use.';
+                ? 'Save your base currency before the first import.'
+                : (isFirstRun
+                    ? 'Required setup is complete. You can continue to upload.'
+                    : 'Core preferences are configured and ready to use.');
         }
         if (setupAction) {
-            setupAction.textContent = requiresCurrencySetup ? 'Choose base currency' : 'Review basics';
-            setupAction.setAttribute('href', requiresCurrencySetup ? '#settings-currency' : '#settings-setup');
+            setupAction.textContent = requiresCurrencySetup
+                ? 'Choose base currency'
+                : (Boolean(setup.can_start_import) && isFirstRun ? 'Continue to upload' : 'Review basics');
+            setupAction.setAttribute('href', requiresCurrencySetup ? '#settings-currency' : (isFirstRun ? '/upload' : '#settings-setup'));
         }
 
         if (currencyValue) {
@@ -399,7 +477,7 @@
         }
         if (currencyHint) {
             currencyHint.textContent = requiresCurrencySetup
-                ? 'Required before the first real workflow.'
+                ? `Required before import. Defaulting to ${String(settings.currency || 'EUR').toUpperCase()} until you save.`
                 : 'Used across charts, budgets, and trends.';
         }
 
@@ -418,7 +496,9 @@
         if (dataHint) {
             const merchantCount = Number(settings.merchant_count || 0).toLocaleString();
             const feedbackCount = Number(settings.feedback_count || 0).toLocaleString();
-            dataHint.textContent = `${merchantCount} learned merchants · ${feedbackCount} feedback events`;
+            dataHint.textContent = Number(settings.tx_count || 0) === 0
+                ? 'No imports yet. Your first upload will build local history.'
+                : `${merchantCount} learned merchants · ${feedbackCount} feedback events`;
         }
     }
 
@@ -578,13 +658,17 @@
     async function saveBaseCurrency() {
         const select = document.getElementById('baseCurrencySelect');
         const button = document.getElementById('saveCurrencyBtn');
+        const checklistButton = document.getElementById('setupSaveCurrencyBtn');
         if (!select || !button) {
             return;
         }
 
         button.disabled = true;
+        if (checklistButton) checklistButton.disabled = true;
         const previousLabel = button.textContent;
+        const previousChecklistLabel = checklistButton ? checklistButton.textContent : '';
         button.textContent = '...';
+        if (checklistButton) checklistButton.textContent = '...';
 
         try {
             const res = await fetch('/api/settings/preferences', {
@@ -603,7 +687,9 @@
             showToast(err.message || 'Currency update failed', 'error');
         } finally {
             button.disabled = false;
+            if (checklistButton) checklistButton.disabled = false;
             button.textContent = previousLabel;
+            if (checklistButton) checklistButton.textContent = previousChecklistLabel;
         }
     }
 
@@ -871,16 +957,19 @@
             }
             updateCycleUI(s);
             updateSettingsOverview(s);
+            renderSetupChecklist(s);
 
             // Provider badge
             const provEl = document.getElementById('provider');
             const provLabels = { local: 'Local · offline', openai: 'OpenAI', gemini: 'Gemini' };
-            provEl.textContent = provLabels[s.provider] || s.provider;
-            provEl.className = `settings-badge ${s.provider === 'local' ? 'local' : 'cloud'}`;
+            provEl.textContent = s.provider_ready
+                ? (provLabels[s.provider] || s.provider)
+                : `${provLabels[s.provider] || s.provider} · credentials missing`;
+            provEl.className = `settings-badge ${s.provider_ready ? (s.provider === 'local' ? 'local' : 'cloud') : 'warning'}`;
 
             // Sheets status
             const sheetsEl = document.getElementById('sheetsStatus');
-            sheetsEl.textContent = s.sheets_connected ? 'Connected' : 'Not configured';
+            sheetsEl.textContent = s.sheets_connected ? 'Connected' : 'Optional · not configured';
             sheetsEl.className = `settings-badge ${s.sheets_connected ? 'local' : ''}`;
 
             // Currency
@@ -898,11 +987,7 @@
             }
 
             const requiresCurrencySetup = Boolean(s.requires_base_currency_setup);
-            const currencyNotice = document.getElementById('currencySetupNotice');
             const currencyBadge = document.getElementById('currencySetupBadge');
-            if (currencyNotice) {
-                currencyNotice.style.display = requiresCurrencySetup ? '' : 'none';
-            }
             if (currencyBadge) {
                 currencyBadge.style.display = requiresCurrencySetup ? '' : 'none';
             }
@@ -1000,7 +1085,7 @@
     loadSettings();
 
     if (new URLSearchParams(window.location.search).get('setup') === 'currency') {
-        showToast('First setup: choose your base currency to continue', 'info');
+        showToast('First-time setup required: save your base currency before importing.', 'info');
     }
 </script>
 {% endblock %}

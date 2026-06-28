@@ -45,7 +45,7 @@ Main capabilities:
 1. Export a statement from your bank.
 2. Start Spectra locally.
 3. Open `http://localhost:8080`.
-4. Set your base currency in **Settings** if this is the first run.
+4. On the first run, Spectra redirects you to **Settings** to complete the required setup.
 5. Upload a `CSV`, `PDF`, or `OFX` file.
 6. Review merchants and categories before importing.
 7. Use the dashboard to inspect spending, budgets, trends, and recurring payments.
@@ -222,13 +222,13 @@ Open `http://localhost:8080`.
 
 When Spectra starts for the first time:
 
-1. Open **Settings**
-2. Set your **Base Currency**
-3. Upload a statement export
-4. Review categories and merchants
-5. Complete the import
+1. Save your **Base Currency** in **Settings**.
+2. Confirm the active categorization mode (`local`, `openai`, or `gemini`).
+3. Optionally configure Google Sheets sync.
+4. Continue to **Upload** and import your first statement.
+5. Review categories and merchants before saving.
 
-This matters because currency conversion, budget tracking, and dashboard totals depend on the configured base currency.
+Spectra blocks imports until the base currency has been saved once. Google Sheets remains optional.
 
 ## Configuration
 
@@ -295,7 +295,9 @@ Runtime data is stored locally in folders such as:
 - `inbox/`
 - `processed/`
 
-By default the local SQLite database lives at `data/prism.db`.
+By default the local SQLite database lives at `data/spectra.db`.
+
+If you already have a legacy `data/prism.db`, Spectra migrates it automatically on startup. If both files exist, Spectra keeps using `data/spectra.db` and leaves the legacy file untouched.
 
 ## Privacy
 

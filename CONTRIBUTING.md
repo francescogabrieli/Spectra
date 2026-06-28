@@ -28,6 +28,7 @@ uv run pytest
 - Keep launcher implementation in `scripts/launchers/`; root launchers should stay as stable wrappers.
 - Use `tools/dev/` for ad hoc developer utilities, prototypes, and playground scripts that are useful to keep in the repo.
 - Treat `data/`, `inbox/`, and `processed/` as local runtime state, not as a place for versioned fixtures.
+- The default local DB path is `data/spectra.db`; keep legacy `data/prism.db` references only where they document migration compatibility.
 
 ## Pull request checklist
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -14,6 +15,52 @@ logger = logging.getLogger("spectra")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _PROJECT_ROOT / ".env"
+_LEGACY_DB_NOTICE_KEYS: set[str] = set()
+
+
+def _log_legacy_db_notice_once(key: str, message: str, *args: object) -> None:
+    if key in _LEGACY_DB_NOTICE_KEYS:
+        return
+    logger.warning(message, *args)
+    _LEGACY_DB_NOTICE_KEYS.add(key)
+
+
+def _prepare_db_path(db_path: Path) -> Path:
+    """Resolve the active DB path and migrate the legacy default DB name if needed."""
+    resolved = db_path if db_path.is_absolute() else (_PROJECT_ROOT / db_path).resolve()
+    if resolved.name != "spectra.db":
+        return resolved
+
+    legacy_path = resolved.with_name("prism.db")
+    if resolved.exists():
+        if legacy_path.exists():
+            _log_legacy_db_notice_once(
+                f"both:{resolved}:{legacy_path}",
+                "Both Spectra DB paths exist. Using %s and leaving legacy %s untouched.",
+                resolved,
+                legacy_path,
+            )
+        return resolved
+
+    if not legacy_path.exists():
+        return resolved
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        legacy_path.replace(resolved)
+        action = "renamed"
+    except OSError:
+        shutil.copy2(legacy_path, resolved)
+        action = "copied"
+
+    _log_legacy_db_notice_once(
+        f"migrated:{resolved}:{legacy_path}",
+        "Migrated legacy Spectra database: %s %s -> %s",
+        action,
+        legacy_path,
+        resolved,
+    )
+    return resolved
 
 
 class Settings(BaseSettings):
@@ -57,7 +104,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
 
     # ── Database ─────────────────────────────────────────────────
-    db_path: Path = Field(default=_PROJECT_ROOT / "data" / "prism.db")
+    db_path: Path = Field(default=_PROJECT_ROOT / "data" / "spectra.db")
 
     # ── Behaviour ────────────────────────────────────────────────
     log_level: str = "INFO"
@@ -66,8 +113,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _check_required_secrets(self) -> "Settings":
         """Warn (don't crash) about missing secrets."""
-        if not self.db_path.is_absolute():
-            self.db_path = (_PROJECT_ROOT / self.db_path).resolve()
+        self.db_path = _prepare_db_path(self.db_path)
 
         credentials_file = Path(self.google_sheets_credentials_file)
         if not credentials_file.is_absolute():

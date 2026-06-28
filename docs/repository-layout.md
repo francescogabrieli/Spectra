@@ -13,11 +13,13 @@
 
 These folders exist to support local usage and Docker volumes:
 
-- `data/`: SQLite database and generated reports.
+- `data/`: SQLite database (`spectra.db` by default) and generated reports.
 - `inbox/`: import drop-zone for CSV/PDF/OFX statements.
 - `processed/`: files already processed by the pipeline.
 
 They should remain unversioned except for placeholder files like `.gitkeep`.
+
+If a local setup still has `data/prism.db`, Spectra will migrate it automatically to `data/spectra.db` on startup.
 
 ## Root file policy
 

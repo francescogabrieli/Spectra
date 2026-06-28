@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import io
 import logging
 import re
 from dataclasses import dataclass
+from datetime import date as calendar_date
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,24 @@ _DEBIT_ALIASES = {
     "addebito", "debit", "uscite", "expense", "out", "dare",
     "uscita", "prelievo", "pagamento",
 }
+_CURRENCY_ALIASES = {
+    "valuta", "currency", "divisa", "moneta"
+}
+
+_FIELD_ALIASES = {
+    "date": _DATE_ALIASES,
+    "description": _DESCRIPTION_ALIASES,
+    "detail": _DETAIL_ALIASES,
+    "counterpart": _COUNTERPART_ALIASES,
+    "category": _CATEGORY_ALIASES,
+    "amount": _AMOUNT_ALIASES,
+    "credit": _CREDIT_ALIASES,
+    "debit": _DEBIT_ALIASES,
+    "currency": _CURRENCY_ALIASES,
+}
+_NUMERIC_DATE_RE = re.compile(
+    r"^\s*(?P<a>\d{1,4})[\/\-.](?P<b>\d{1,2})[\/\-.](?P<c>\d{1,4})\s*$"
+)
 
 
 @dataclass
@@ -82,6 +102,11 @@ def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
+def _normalize_header_name(value: str) -> str:
+    """Normalize column names across casing, punctuation, and repeated spaces."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())).strip()
+
+
 def _detect_delimiter(sample: str) -> str:
     """Detect CSV delimiter from a sample of the file."""
     counts = {
@@ -95,45 +120,114 @@ def _detect_delimiter(sample: str) -> str:
 
 def _parse_amount(raw: str) -> float:
     """Parse an amount string handling Italian and English formats."""
-    # Remove currency symbols and whitespace
-    s = re.sub(r"[€$£\s]", "", raw.strip())
-    # Strip leading '+' (some banks like ISyBank use +1.500,00 for credits)
-    positive = s.startswith("+")
-    s = s.lstrip("+")
-    # Handle negative in parentheses: (100.00) → -100.00
-    if s.startswith("(") and s.endswith(")"):
-        s = "-" + s[1:-1]
-    # Italian format: 1.234,56 → 1234.56
-    if re.match(r"^-?\d{1,3}(\.\d{3})*(,\d+)?$", s):
-        s = s.replace(".", "").replace(",", ".")
-    # Remove thousands separator (English: 1,234.56)
-    elif re.match(r"^-?\d{1,3}(,\d{3})*(\.\d+)?$", s):
-        s = s.replace(",", "")
-    # Simple comma as decimal: 1234,56
-    else:
-        s = s.replace(",", ".")
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        raise ValueError(f"Cannot parse amount: {raw!r}")
+
+    negative = False
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        negative = True
+        cleaned = cleaned[1:-1]
+    if cleaned.endswith("-"):
+        negative = True
+        cleaned = cleaned[:-1]
+    if cleaned.startswith("-"):
+        negative = True
+    positive = cleaned.startswith("+")
+
+    s = re.sub(r"(?i)\b(?:eur|usd|gbp|chf|cad|aud|jpy|sek|nok|dkk)\b", "", cleaned)
+    s = re.sub(r"[€$£¥\s']", "", s)
+    s = s.lstrip("+-")
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        if re.search(r",\d{1,2}$", s):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s:
+        if not re.search(r"\.\d{1,2}$", s):
+            s = s.replace(".", "")
+
     try:
         result = float(s)
-        return abs(result) if positive else result
+        if negative:
+            return -abs(result)
+        if positive:
+            return abs(result)
+        return result
     except ValueError:
         raise ValueError(f"Cannot parse amount: {raw!r}")
 
 
-def _parse_date(raw: str) -> str:
+def _infer_day_first_preference(raw_dates: list[str]) -> bool:
+    """Prefer day-first dates unless the sample clearly points to month-first."""
+    day_first_votes = 0
+    month_first_votes = 0
+
+    for raw in raw_dates:
+        match = _NUMERIC_DATE_RE.match(str(raw or ""))
+        if not match:
+            continue
+        a = int(match.group("a"))
+        b = int(match.group("b"))
+        c = int(match.group("c"))
+        if a > 999:
+            continue
+        if a > 12 and b <= 12:
+            day_first_votes += 1
+        elif b > 12 and a <= 12:
+            month_first_votes += 1
+        elif c > 31:
+            # Ambiguous date with trailing year: keep collecting, but default later.
+            continue
+
+    return month_first_votes < day_first_votes or month_first_votes == 0
+
+
+def _parse_date(raw: str, prefer_day_first: bool = True) -> str:
     """Normalize date to YYYY-MM-DD from common formats."""
     from datetime import datetime
+
     s = raw.strip()
+    if re.fullmatch(r"\d{8}", s):
+        dt = datetime.strptime(s, "%Y%m%d")
+        if dt.year < 2000 or dt.year > 2100:
+            raise ValueError(f"Cannot parse date: {raw!r}")
+        return dt.strftime("%Y-%m-%d")
+
+    match = _NUMERIC_DATE_RE.match(s)
+    if match:
+        a = int(match.group("a"))
+        b = int(match.group("b"))
+        c = int(match.group("c"))
+
+        if a > 999:
+            year, month, day = a, b, c
+        else:
+            year = c + 2000 if c < 100 else c
+            if a > 12 and b <= 12:
+                day, month = a, b
+            elif b > 12 and a <= 12:
+                month, day = a, b
+            elif prefer_day_first:
+                day, month = a, b
+            else:
+                month, day = a, b
+
+        dt = calendar_date(year, month, day)
+        if dt.year < 2000 or dt.year > 2100:
+            raise ValueError(f"Cannot parse date: {raw!r}")
+        return dt.isoformat()
 
     # Try strptime formats (ordered most-specific first)
     fmt_list = [
         ("%Y-%m-%d", True),   # ISO: 2026-02-22
-        ("%d/%m/%Y", False),  # EU: 22/02/2026
-        ("%d-%m-%Y", False),  # EU: 22-02-2026
-        ("%d.%m.%Y", False),  # DE: 22.02.2026
-        ("%m/%d/%Y", False),  # US: 02/22/2026
-        ("%m/%d/%y", False),  # US short: 1/31/26  ← ISyBank
-        ("%d/%m/%y", False),  # EU short: 22/02/26
-        ("%Y%m%d",  True),    # Compact: 20260222
+        ("%d %m %Y", False),
     ]
     for fmt, _ in fmt_list:
         try:
@@ -154,36 +248,82 @@ def _make_id(date: str, description: str, amount: float) -> str:
     key = f"{date}|{description.strip().lower()}|{amount:.2f}"
     return "CSV-" + hashlib.sha1(key.encode()).hexdigest()[:16]
 
-
-_CURRENCY_ALIASES = {
-    "valuta", "currency", "divisa", "moneta"
-}
-
 def _map_columns(headers: list[str]) -> dict[str, int]:
     """Find the indices of required columns based on known aliases."""
     mapping: dict[str, int] = {}
     for i, h_raw in enumerate(headers):
-        h = h_raw.strip().lower()
-        if h in _DATE_ALIASES:
-            mapping.setdefault("date", i)
-        if h in _DESCRIPTION_ALIASES:
-            mapping.setdefault("description", i)
-        if h in _DETAIL_ALIASES:
-            mapping.setdefault("detail", i)   # secondary detail column
-        if h in _COUNTERPART_ALIASES:
-            mapping.setdefault("counterpart", i)
-        if h in _CATEGORY_ALIASES:
-            mapping.setdefault("category", i)
-        if h in _AMOUNT_ALIASES:
-            mapping.setdefault("amount", i)
-        if h in _CREDIT_ALIASES:
-            mapping.setdefault("credit", i)
-        if h in _DEBIT_ALIASES:
-            mapping.setdefault("debit", i)
-        if h in _CURRENCY_ALIASES:
-            mapping.setdefault("currency", i)
+        normalized = _normalize_header_name(h_raw)
+        normalized_compact = normalized.replace(" ", "")
+        for field, aliases in _FIELD_ALIASES.items():
+            if field in mapping:
+                continue
+            if any(
+                normalized == alias
+                or normalized.startswith(f"{alias} ")
+                or normalized.endswith(f" {alias}")
+                or normalized_compact == alias.replace(" ", "")
+                for alias in aliases
+            ):
+                mapping[field] = i
+                break
 
     return mapping
+
+
+def _locate_header_row(rows: list[list[str]]) -> tuple[int, list[str], list[list[str]], dict[str, int]]:
+    """Find the most likely header row and return headers, data rows, and mapped columns."""
+    for i, row in enumerate(rows):
+        col_candidate = _map_columns(row)
+        if "date" in col_candidate and (
+            "description" in col_candidate
+            or "amount" in col_candidate
+            or "credit" in col_candidate
+            or "debit" in col_candidate
+        ):
+            return i, row, rows[i + 1 :], col_candidate
+
+    for i, row in enumerate(rows):
+        if len([c for c in row if c.strip()]) >= 3:
+            headers = row
+            return i, headers, rows[i + 1 :], _map_columns(headers)
+
+    raise ValueError("CSV file is empty or does not contain a usable header row.")
+
+
+def _clean_cell_text(value: str) -> str:
+    return re.sub(r"\s*\n\s*", " | ", str(value or "").strip())
+
+
+def _build_raw_description(primary_description: str, detail: str) -> str:
+    primary = _clean_cell_text(primary_description)
+    secondary = _clean_cell_text(detail)
+    if secondary and secondary.lower() != primary.lower():
+        return f"{primary} | {secondary}" if primary else secondary
+    return primary
+
+
+def _parse_row_amount(row: list[str], col: dict[str, int]) -> float:
+    if "amount" in col:
+        raw_amount = row[col["amount"]].strip()
+        if not raw_amount:
+            raise ValueError("Missing amount value")
+        return _parse_amount(raw_amount)
+
+    raw_credit = row[col["credit"]].strip() if "credit" in col else ""
+    raw_debit = row[col["debit"]].strip() if "debit" in col else ""
+    credit = _parse_amount(raw_credit) if raw_credit else 0.0
+    debit = _parse_amount(raw_debit) if raw_debit else 0.0
+    if not raw_credit and not raw_debit:
+        raise ValueError("Missing split debit/credit values")
+    return abs(credit) - abs(debit)
+
+
+def _resolve_row_currency(row: list[str], col: dict[str, int], default_currency: str) -> str:
+    if "currency" in col and col["currency"] < len(row):
+        value = row[col["currency"]].strip().upper()
+        if value:
+            return value
+    return default_currency
 
 
 def _clean_description(text: str) -> str:
@@ -302,8 +442,9 @@ def _extract_counterpart(
     for text in (str(raw_description or "").strip(), str(detail or "").strip()):
         if not text:
             continue
+        normalized_text = re.sub(r"\s+", " ", text)
         for pattern in _COUNTERPART_CAPTURE_PATTERNS:
-            match = pattern.search(text)
+            match = pattern.search(normalized_text)
             if not match:
                 continue
             candidate = _clean_counterpart(match.group("value"))
@@ -339,26 +480,12 @@ def parse_csv(
     delimiter = _detect_delimiter(raw[:2000])
     logger.info("Detected delimiter: %r for file: %s", delimiter, path.name)
 
-    reader = csv.reader(raw.splitlines(), delimiter=delimiter)
+    reader = csv.reader(io.StringIO(raw), delimiter=delimiter)
     rows = list(reader)
+    if not rows:
+        return []
 
-    # Scan rows to find the real header: first row where at least 'date' maps
-    header_idx = 0
-    for i, row in enumerate(rows):
-        col_candidate = _map_columns(row)
-        if "date" in col_candidate:
-            header_idx = i
-            break
-    else:
-        # Fallback: first row with ≥3 non-empty cells
-        for i, row in enumerate(rows):
-            if len([c for c in row if c.strip()]) >= 3:
-                header_idx = i
-                break
-
-    headers = rows[header_idx]
-    data_rows = rows[header_idx + 1:]
-    col = _map_columns(headers)
+    header_idx, headers, data_rows, col = _locate_header_row(rows)
 
     logger.info(
         "Headers: %s → mapped: %s", headers, col
@@ -380,6 +507,13 @@ def parse_csv(
 
     transactions: list[ParsedTransaction] = []
     skipped = 0
+    day_first = _infer_day_first_preference(
+        [
+            candidate_row[col["date"]].strip()
+            for candidate_row in data_rows[:25]
+            if len(candidate_row) > col["date"] and candidate_row[col["date"]].strip()
+        ]
+    )
 
     for row_num, row in enumerate(data_rows, start=header_idx + 2):
         # Skip empty rows
@@ -394,7 +528,7 @@ def parse_csv(
             if not raw_date:
                 continue
 
-            date = _parse_date(raw_date)
+            date = _parse_date(raw_date, prefer_day_first=day_first)
 
             # Primary description + optional detail column (merged for AI context)
             primary_description = row[col["description"]].strip() if "description" in col else ""
@@ -411,33 +545,16 @@ def parse_csv(
                 explicit_counterpart=explicit_counterpart,
             )
 
-            raw_desc = primary_description
-            if detail and detail.lower() != primary_description.lower():
-                raw_desc = f"{raw_desc} | {detail}"
-
+            raw_desc = _build_raw_description(primary_description, detail)
             description = _clean_description(raw_desc)
+            if not description:
+                raise ValueError("Missing description")
 
-            # Amount: either a single column or split credit/debit
-            if "amount" in col:
-                raw_amount = row[col["amount"]].strip()
-                if not raw_amount:
-                    continue
-                amount = _parse_amount(raw_amount)
-            else:
-                raw_credit = row[col["credit"]].strip() if "credit" in col else ""
-                raw_debit = row[col["debit"]].strip() if "debit" in col else ""
-                credit = _parse_amount(raw_credit) if raw_credit else 0.0
-                debit = _parse_amount(raw_debit) if raw_debit else 0.0
-                # Credits are positive, debits are negative
-                amount = abs(credit) - abs(debit)
+            amount = _parse_row_amount(row, col)
 
             tx_id = _make_id(date, description, amount)
-            
-            row_currency = currency
-            if "currency" in col and col["currency"] < len(row):
-                val = row[col["currency"]].strip().upper()
-                if val:
-                    row_currency = val
+
+            row_currency = _resolve_row_currency(row, col, currency)
 
             statement_category = ""
             if "category" in col and col["category"] < len(row):

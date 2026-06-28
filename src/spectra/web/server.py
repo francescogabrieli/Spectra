@@ -65,6 +65,10 @@ _BASE_CURRENCY_SETTING_KEY = "base_currency"
 _VALID_THEME_PREFERENCES = {"auto", "light", "dark"}
 _VALID_SUMMARY_SCOPES = {"cycle", "90d", "ytd"}
 _CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+_SETUP_SETTINGS_URL = "/settings?setup=currency"
+_BASE_CURRENCY_SETUP_MESSAGE = (
+    "Base currency not set. Open Settings and save your base currency before importing."
+)
 _TRANSACTION_EXPORT_HEADERS = [
     "tx_id",
     "date",
@@ -197,12 +201,120 @@ def _resolve_base_currency(settings: Settings, db: BookmarkDB) -> str:
     return from_env or "EUR"
 
 
-def _requires_base_currency_setup(db: BookmarkDB) -> bool:
-    if _normalize_currency_code(db.get_app_setting(_BASE_CURRENCY_SETTING_KEY)):
-        return False
+def _provider_is_ready(settings: Settings) -> bool:
+    if settings.ai_provider == "local":
+        return True
+    if settings.ai_provider == "openai":
+        return bool(settings.openai_api_key)
+    return bool(settings.gemini_api_key)
+
+
+def _build_setup_status(settings: Settings, db: BookmarkDB) -> dict[str, Any]:
+    stored_base_currency = _normalize_currency_code(db.get_app_setting(_BASE_CURRENCY_SETTING_KEY))
+    effective_currency = _resolve_base_currency(settings, db)
     tx_count_row = db._conn.execute("SELECT COUNT(*) FROM tx_history").fetchone()
     tx_count = int(tx_count_row[0] if tx_count_row else 0)
-    return tx_count == 0
+    has_existing_transactions = tx_count > 0
+    requires_base_currency_setup = stored_base_currency is None and not has_existing_transactions
+    google_sheets_configured = bool(settings.spreadsheet_id)
+    provider_ready = _provider_is_ready(settings)
+    can_start_import = not requires_base_currency_setup and provider_ready
+
+    steps = [
+        {
+            "id": "base_currency",
+            "label": "Choose base currency",
+            "status": "required" if requires_base_currency_setup else "complete",
+            "required": True,
+            "detail": (
+                "Required before the first import."
+                if requires_base_currency_setup
+                else f"Saved as {effective_currency}."
+            ),
+            "action_label": "Save base currency",
+            "action_href": "#settings-currency",
+        },
+        {
+            "id": "provider",
+            "label": "Confirm categorization mode",
+            "status": "complete" if provider_ready else "attention",
+            "required": True,
+            "detail": (
+                f"{settings.ai_provider} is active."
+                if provider_ready
+                else f"{settings.ai_provider} is selected but still missing credentials."
+            ),
+            "action_label": "Review provider",
+            "action_href": "#settings-provider",
+        },
+        {
+            "id": "google_sheets",
+            "label": "Optional Google Sheets sync",
+            "status": "complete" if google_sheets_configured else "optional",
+            "required": False,
+            "detail": (
+                "Connected."
+                if google_sheets_configured
+                else "Optional. Spectra works fully locally without it."
+            ),
+            "action_label": "Review sync",
+            "action_href": "#settings-provider",
+        },
+        {
+            "id": "first_import",
+            "label": "Start first import",
+            "status": "ready" if can_start_import else "blocked",
+            "required": True,
+            "detail": (
+                "Upload a CSV, PDF, or OFX export."
+                if can_start_import
+                else "Complete the required steps above first."
+            ),
+            "action_label": "Continue to upload",
+            "action_href": "/upload",
+        },
+    ]
+
+    if requires_base_currency_setup:
+        recommended_next_action = "Save base currency"
+    elif not provider_ready:
+        recommended_next_action = "Review provider credentials"
+    elif not has_existing_transactions:
+        recommended_next_action = "Continue to upload"
+    else:
+        recommended_next_action = "Review setup"
+
+    return {
+        "is_first_run": not has_existing_transactions,
+        "requires_base_currency_setup": requires_base_currency_setup,
+        "base_currency_configured": stored_base_currency is not None,
+        "base_currency_source": "saved" if stored_base_currency else "default",
+        "provider": settings.ai_provider,
+        "provider_ready": provider_ready,
+        "google_sheets_configured": google_sheets_configured,
+        "has_existing_transactions": has_existing_transactions,
+        "can_start_import": can_start_import,
+        "recommended_next_action": recommended_next_action,
+        "steps": steps,
+        "settings_url": _SETUP_SETTINGS_URL,
+    }
+
+
+def _requires_base_currency_setup(db: BookmarkDB) -> bool:
+    settings = load_settings()
+    return bool(_build_setup_status(settings, db)["requires_base_currency_setup"])
+
+
+def _base_currency_setup_response(*, include_ok: bool) -> JSONResponse:
+    payload: dict[str, Any] = {
+        "error": _BASE_CURRENCY_SETUP_MESSAGE,
+        "message": _BASE_CURRENCY_SETUP_MESSAGE,
+        "requires_base_currency_setup": True,
+        "settings_url": _SETUP_SETTINGS_URL,
+    }
+    if include_ok:
+        payload["ok"] = False
+    return JSONResponse(payload, status_code=400)
 
 
 def _setup_redirect_if_needed(request: Request) -> RedirectResponse | None:
@@ -210,8 +322,8 @@ def _setup_redirect_if_needed(request: Request) -> RedirectResponse | None:
         return None
     settings = load_settings()
     with BookmarkDB(settings.db_path) as db:
-        if _requires_base_currency_setup(db):
-            return RedirectResponse(url="/settings?setup=currency", status_code=303)
+        if _build_setup_status(settings, db)["requires_base_currency_setup"]:
+            return RedirectResponse(url=_SETUP_SETTINGS_URL, status_code=303)
     return None
 
 
@@ -1155,7 +1267,7 @@ async def api_settings():
     with _get_db() as db:
         preferences = _load_app_preferences(db)
         effective_currency = _resolve_base_currency(settings, db)
-        requires_currency_setup = _requires_base_currency_setup(db)
+        setup_status = _build_setup_status(settings, db)
         tx_count = db._conn.execute("SELECT COUNT(*) FROM tx_history").fetchone()[0]
         merchant_count = db._conn.execute("SELECT COUNT(*) FROM merchant_categories").fetchone()[0]
         feedback_count = db._conn.execute("SELECT COUNT(*) FROM learning_feedback").fetchone()[0]
@@ -1166,16 +1278,16 @@ async def api_settings():
             "SELECT DISTINCT category FROM tx_history WHERE category != 'Uncategorized'"
         ).fetchall()
     return {
-        "provider": settings.ai_provider,
         "currency": effective_currency,
-        "requires_base_currency_setup": requires_currency_setup,
         "tx_count": tx_count,
         "merchant_count": merchant_count,
         "feedback_count": feedback_count,
         "active_rule_count": active_rule_count,
         "category_count": len(cats),
-        "sheets_connected": bool(settings.spreadsheet_id),
+        "sheets_connected": setup_status["google_sheets_configured"],
         **preferences,
+        **setup_status,
+        "setup_status": setup_status,
         "current_cycle": _build_cycle_payload(preferences["cycle_rule"]),
     }
 
@@ -1240,13 +1352,15 @@ async def api_update_preferences(request: Request):
         for key, value in updates.items():
             db.set_app_setting(key, value)
         preferences = _load_app_preferences(db)
-        effective_currency = _resolve_base_currency(load_settings(), db)
-        requires_currency_setup = _requires_base_currency_setup(db)
+        settings = load_settings()
+        effective_currency = _resolve_base_currency(settings, db)
+        setup_status = _build_setup_status(settings, db)
     return {
         "ok": True,
         **preferences,
         "currency": effective_currency,
-        "requires_base_currency_setup": requires_currency_setup,
+        **setup_status,
+        "setup_status": setup_status,
         "current_cycle": _build_cycle_payload(preferences["cycle_rule"]),
     }
 
@@ -1436,11 +1550,8 @@ async def api_upload(file: UploadFile = File(...)):
 
     settings = load_settings()
     with BookmarkDB(settings.db_path) as db:
-        if _requires_base_currency_setup(db):
-            return JSONResponse(
-                {"error": "Base currency not set. Open Settings and choose your base currency first."},
-                status_code=400,
-            )
+        if _build_setup_status(settings, db)["requires_base_currency_setup"]:
+            return _base_currency_setup_response(include_ok=False)
         base_currency = _resolve_base_currency(settings, db)
 
     suffix = Path(file.filename or "upload.csv").suffix.lower()
@@ -1670,11 +1781,8 @@ async def api_confirm(request: Request):
 
     settings = load_settings()
     with BookmarkDB(settings.db_path) as db:
-        if _requires_base_currency_setup(db):
-            return JSONResponse(
-                {"ok": False, "message": "Base currency not set. Open Settings and choose your base currency first."},
-                status_code=400,
-            )
+        if _build_setup_status(settings, db)["requires_base_currency_setup"]:
+            return _base_currency_setup_response(include_ok=True)
         base_currency = _resolve_base_currency(settings, db)
 
     with _get_db() as db:

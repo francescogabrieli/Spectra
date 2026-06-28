@@ -90,3 +90,32 @@ def test_extract_from_text_with_pypdf_parses_wrapped_transactions(tmp_path: Path
     assert txns[0].statement_category.lower() == "stipendi e pensioni"
     assert txns[1].date == "2026-04-29"
     assert txns[1].amount == -5.22
+
+
+def test_extract_from_text_with_pypdf_ignores_noise_between_wrapped_rows(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "statement.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _Page:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class _Reader:
+        def __init__(self, _: str) -> None:
+            self.pages = [
+                _Page(
+                    "Statement summary page 1\n"
+                    "14.02.2026 Coffee Shop NO Food & Dining € -3,50\n"
+                    "Random footer that should be ignored\n"
+                    "15.02.2026 Salary SI Income € 1.800,00"
+                ),
+            ]
+
+    txns = _extract_from_text_with_pypdf(pdf_path, _Reader, "EUR")
+
+    assert len(txns) == 2
+    assert txns[0].statement_category == "Food & Dining"
+    assert txns[1].statement_category == "Income"

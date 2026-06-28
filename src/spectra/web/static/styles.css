@@ -1423,6 +1423,73 @@ td.amount.income {
     max-width: 860px;
 }
 
+.settings-checklist {
+    display: grid;
+    gap: 12px;
+}
+
+.settings-checklist-item {
+    display: grid;
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    gap: 14px;
+    align-items: center;
+    padding: 14px 0;
+    border-top: 1px solid var(--border-light);
+}
+
+.settings-checklist-item:first-child {
+    border-top: none;
+    padding-top: 4px;
+}
+
+.settings-checklist-step {
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-light);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.settings-checklist-copy strong {
+    display: block;
+    font-size: 14px;
+    color: var(--text);
+}
+
+.settings-checklist-copy p {
+    margin-top: 4px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-muted);
+}
+
+.settings-checklist-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.settings-cta-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 18px;
+}
+
+.btn.is-disabled,
+.btn[aria-disabled="true"] {
+    pointer-events: none;
+    opacity: 0.6;
+}
+
 .settings-stats-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -2300,6 +2367,15 @@ td.amount.income {
 
     .review-item-head {
         flex-direction: column;
+    }
+
+    .settings-checklist-item {
+        grid-template-columns: 1fr;
+    }
+
+    .settings-checklist-actions,
+    .settings-cta-row {
+        justify-content: flex-start;
     }
 }
 
