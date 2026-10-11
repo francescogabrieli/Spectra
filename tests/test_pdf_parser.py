@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from spectra.pdf_parser import _extract_from_text_with_pypdf
+from spectra.pdf_parser import _extract_from_text_with_pypdf, _rows_to_transactions
 
 
 def test_extract_from_text_with_pypdf_parses_valid_lines(tmp_path: Path) -> None:
@@ -119,3 +119,45 @@ def test_extract_from_text_with_pypdf_ignores_noise_between_wrapped_rows(tmp_pat
     assert len(txns) == 2
     assert txns[0].statement_category == "Food & Dining"
     assert txns[1].statement_category == "Income"
+
+
+def test_table_identity_includes_account_currency_and_repeated_rows() -> None:
+    transactions = _rows_to_transactions(
+        ["Date", "Description", "Amount", "Currency", "Account"],
+        [
+            ["22/02/2026", "MARKET", "-10.00", "EUR", "Checking A"],
+            ["22/02/2026", "MARKET", "-10.00", "EUR", "Checking A"],
+            ["22/02/2026", "MARKET", "-10.00", "EUR", "Checking B"],
+            ["22/02/2026", "MARKET", "-10.00", "USD", "Checking A"],
+        ],
+        "EUR",
+    )
+
+    assert len({tx.id for tx in transactions}) == 4
+    assert transactions[0].id != transactions[1].id
+    assert transactions[0].id != transactions[2].id
+    assert transactions[0].id != transactions[3].id
+    assert transactions[0].account_id != transactions[2].account_id
+    assert transactions[0].legacy_id == transactions[2].legacy_id
+
+
+def test_text_identity_includes_currency_and_repeated_rows(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "statement.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class _Page:
+        def extract_text(self) -> str:
+            return "\n".join([
+                "22/02/2026 MARKET -10.00 EUR",
+                "22/02/2026 MARKET -10.00 EUR",
+            ])
+
+    class _Reader:
+        def __init__(self, _: str) -> None:
+            self.pages = [_Page()]
+
+    transactions = _extract_from_text_with_pypdf(pdf_path, _Reader, "USD")
+    assert len(transactions) == 2
+    assert transactions[0].id != transactions[1].id
+    assert transactions[0].currency == "EUR"
+    assert transactions[0].legacy_id == transactions[1].legacy_id

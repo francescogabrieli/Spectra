@@ -5,12 +5,82 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from spectra.money import as_decimal, quantize_money
 
 logger = logging.getLogger("spectra.dashboard")
 
 
-def refresh_dashboard(sheets_client: Any) -> None:
+def _summarize_rows(
+    all_rows: list[list[str]], base_currency: str,
+) -> tuple[dict[str, Decimal], dict[str, dict[str, Decimal]], dict[str, dict[str, Any]], int]:
+    """Aggregate only rows whose saved amount denomination matches the base."""
+    if len(all_rows) < 2:
+        return {}, {}, {}, 0
+    header = [str(value).strip().casefold() for value in all_rows[0]]
+    try:
+        date_idx = header.index("date")
+        cat_idx = header.index("category")
+        amt_idx = header.index("amount")
+        currency_idx = header.index("currency")
+    except ValueError:
+        logger.warning("Required Date, Category, Amount, or Currency columns not found")
+        return {}, {}, {}, 0
+
+    merch_idx = header.index("merchant") if "merchant" in header else None
+    recur_idx = header.index("recurring") if "recurring" in header else None
+    base_currency = str(base_currency).strip().upper()
+    cat_totals: dict[str, Decimal] = defaultdict(Decimal)
+    monthly: dict[str, dict[str, Decimal]] = defaultdict(
+        lambda: {"income": Decimal(0), "expenses": Decimal(0)}
+    )
+    recurring_items: dict[str, dict[str, Any]] = {}
+    included = 0
+
+    for row in all_rows[1:]:
+        if len(row) <= max(date_idx, cat_idx, amt_idx, currency_idx):
+            continue
+        # Empty and other-currency rows are not comparable. In particular,
+        # FX-failed transactions retain their source currency and stay out.
+        if str(row[currency_idx]).strip().upper() != base_currency:
+            continue
+        try:
+            date_str = str(row[date_idx]).strip()
+            category = str(row[cat_idx]).strip() or "Other"
+            amount = as_decimal(str(row[amt_idx]).strip().replace(",", "."))
+            month = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y-%m")
+        except (ValueError, IndexError, InvalidOperation):
+            continue
+        included += 1
+        if amount < 0:
+            cat_totals[category] += abs(amount)
+        if amount >= 0:
+            monthly[month]["income"] += amount
+        else:
+            monthly[month]["expenses"] += abs(amount)
+
+        if recur_idx is not None and recur_idx < len(row):
+            recur_type = str(row[recur_idx]).strip()
+            if recur_type:
+                merchant = (
+                    str(row[merch_idx]).strip()
+                    if merch_idx is not None and merch_idx < len(row)
+                    else category
+                )
+                key = merchant.lower()
+                if key not in recurring_items:
+                    recurring_items[key] = {
+                        "name": merchant, "type": recur_type,
+                        "total": Decimal(0), "count": 0,
+                    }
+                recurring_items[key]["total"] += amount
+                recurring_items[key]["count"] += 1
+    return cat_totals, monthly, recurring_items, included
+
+
+def refresh_dashboard(sheets_client: Any, base_currency: str = "EUR") -> None:
     """Read Transactions sheet → compute summaries → write Dashboard tab → create charts."""
 
     # ── 1. Read all transactions ──────────────────────────────────
@@ -19,56 +89,12 @@ def refresh_dashboard(sheets_client: Any) -> None:
         logger.info("No data to build dashboard")
         return
 
-    header = all_rows[0]
-    try:
-        date_idx = header.index("Date")
-        cat_idx = header.index("Category")
-        amt_idx = header.index("Amount")
-    except ValueError:
-        logger.warning("Required columns not found: %s", header)
+    # ── 2. Compute summaries in one explicit denomination ──────────
+    currency = str(base_currency).strip().upper()
+    cat_totals, monthly, recurring_items, included = _summarize_rows(all_rows, currency)
+    if not included:
+        logger.info("No %s-denominated rows to build dashboard", currency)
         return
-
-    merch_idx = header.index("Merchant") if "Merchant" in header else None
-    recur_idx = header.index("Recurring") if "Recurring" in header else None
-
-    # ── 2. Compute summaries ──────────────────────────────────────
-    cat_totals: dict[str, float] = defaultdict(float)
-    monthly: dict[str, dict[str, float]] = defaultdict(lambda: {"income": 0.0, "expenses": 0.0})
-    recurring_items: dict[str, dict[str, Any]] = {}
-
-    for row in all_rows[1:]:
-        if len(row) <= max(date_idx, cat_idx, amt_idx):
-            continue
-        try:
-            date_str = row[date_idx].strip()
-            category = row[cat_idx].strip() or "Other"
-            amount = float(row[amt_idx].replace(",", "."))
-        except (ValueError, IndexError):
-            continue
-
-        if amount < 0:
-            cat_totals[category] += abs(amount)
-
-        try:
-            month = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y-%m")
-        except ValueError:
-            continue
-        if amount >= 0:
-            monthly[month]["income"] += amount
-        else:
-            monthly[month]["expenses"] += abs(amount)
-
-        # Recurring items
-        if recur_idx is not None and recur_idx < len(row):
-            recur_type = row[recur_idx].strip()
-            if recur_type:
-                merchant = row[merch_idx].strip() if merch_idx and merch_idx < len(row) else category
-                key = merchant.lower()
-                if key not in recurring_items:
-                    recurring_items[key] = {"name": merchant, "type": recur_type, "total": 0.0, "count": 0}
-                recurring_items[key]["total"] += amount
-                recurring_items[key]["count"] += 1
-
     sorted_cats = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
     sorted_months = sorted(monthly.keys())[-6:]
 
@@ -85,15 +111,16 @@ def refresh_dashboard(sheets_client: Any) -> None:
     # ── 4. Write summary tables ───────────────────────────────────
 
     # Table A: Spending by Category (A1)
-    cat_header = [["Category", "Total Spent (€)"]]
-    cat_rows = [[name, round(total, 2)] for name, total in sorted_cats]
+    cat_header = [["Category", f"Total Spent ({currency})"]]
+    cat_rows = [[name, float(quantize_money(total, currency))] for name, total in sorted_cats]
     ws.update("A1", cat_header + cat_rows)
 
     # Table B: Monthly summary (D1)
-    month_header = [["Month", "Income (€)", "Expenses (€)", "Net (€)"]]
+    month_header = [["Month", f"Income ({currency})", f"Expenses ({currency})", f"Net ({currency})"]]
     month_rows = [
-        [m, round(monthly[m]["income"], 2), round(monthly[m]["expenses"], 2),
-         round(monthly[m]["income"] - monthly[m]["expenses"], 2)]
+        [m, float(quantize_money(monthly[m]["income"], currency)),
+         float(quantize_money(monthly[m]["expenses"], currency)),
+         float(quantize_money(monthly[m]["income"] - monthly[m]["expenses"], currency))]
         for m in sorted_months
     ]
     ws.update("D1", month_header + month_rows)
@@ -110,13 +137,17 @@ def refresh_dashboard(sheets_client: Any) -> None:
             key=lambda x: x["total"], reverse=True,
         )
 
-        recur_header = [["Recurring Cash Flow", "Type", "Amount (€)"]]
+        recur_header = [["Recurring Cash Flow", "Type", f"Amount ({currency})"]]
         for item in subs + income:
-            avg = round(item["total"] / max(item["count"], 1), 2)
+            avg = float(quantize_money(item["total"] / max(item["count"], 1), currency))
             recur_rows.append([item["name"], item["type"], avg])
 
-        sub_total = round(sum(v["total"] / max(v["count"], 1) for v in subs), 2)
-        inc_total = round(sum(v["total"] / max(v["count"], 1) for v in income), 2)
+        sub_total = float(quantize_money(sum(
+            (v["total"] / max(v["count"], 1) for v in subs), Decimal(0)
+        ), currency))
+        inc_total = float(quantize_money(sum(
+            (v["total"] / max(v["count"], 1) for v in income), Decimal(0)
+        ), currency))
         recur_rows.append(["", "", ""])
         recur_rows.append(["Total Subscriptions/mo", "", sub_total])
         recur_rows.append(["Total Recurring Income/mo", "", inc_total])
@@ -125,11 +156,11 @@ def refresh_dashboard(sheets_client: Any) -> None:
 
     # Table D: Budget Status (L1)
     from spectra.budget import read_budgets, sync_budget_sheet, compute_budget_status
-    sync_budget_sheet(sheets_client, [cat for cat, _ in sorted_cats])
-    budgets = read_budgets(sheets_client)
-    budget_status = compute_budget_status(dict(sorted_cats), budgets)
+    sync_budget_sheet(sheets_client, [cat for cat, _ in sorted_cats], currency)
+    budgets = read_budgets(sheets_client, currency)
+    budget_status = compute_budget_status(dict(sorted_cats), budgets, currency)
 
-    budget_header = [["Category", "Spent (€)", "Budget (€)", "% Used", "Status"]]
+    budget_header = [["Category", f"Spent ({currency})", f"Budget ({currency})", "% Used", "Status"]]
     budget_rows = [
         [b["category"], b["spent"], b["budget"], b["pct"], b["status"]]
         for b in budget_status
@@ -244,9 +275,9 @@ def refresh_dashboard(sheets_client: Any) -> None:
         if n_cats > 0:
             add_requests.append(_donut_chart(dashboard_id, n_cats))
         if n_months > 0:
-            add_requests.append(_monthly_expenses_chart(dashboard_id, n_months))
+            add_requests.append(_monthly_expenses_chart(dashboard_id, n_months, currency))
         if n_months > 0:
-            add_requests.append(_income_vs_expenses_chart(dashboard_id, n_months))
+            add_requests.append(_income_vs_expenses_chart(dashboard_id, n_months, currency))
 
         if delete_requests or add_requests:
             service.spreadsheets().batchUpdate(
@@ -264,7 +295,7 @@ def refresh_dashboard(sheets_client: Any) -> None:
     # ── 7. Refresh YoY Trends tab ─────────────────────────────────────
     try:
         from spectra.trends import refresh_trends
-        refresh_trends(sheets_client)
+        refresh_trends(sheets_client, currency)
     except Exception as e:
         logger.warning("Trends tab update failed: %s", e)
 
@@ -291,7 +322,7 @@ def _donut_chart(sheet_id: int, n_rows: int) -> dict[str, Any]:
     }
 
 
-def _monthly_expenses_chart(sheet_id: int, n_rows: int) -> dict[str, Any]:
+def _monthly_expenses_chart(sheet_id: int, n_rows: int, currency: str = "EUR") -> dict[str, Any]:
     return {
         "addChart": {
             "chart": {
@@ -302,7 +333,7 @@ def _monthly_expenses_chart(sheet_id: int, n_rows: int) -> dict[str, Any]:
                         "legendPosition": "BOTTOM_LEGEND",
                         "axis": [
                             {"position": "BOTTOM_AXIS", "title": "Month"},
-                            {"position": "LEFT_AXIS", "title": "€"},
+                            {"position": "LEFT_AXIS", "title": currency},
                         ],
                         "domains": [
                             {"domain": {"sourceRange": {"sources": [_range(sheet_id, 1, 3, 1 + n_rows, 4)]}}}
@@ -319,7 +350,7 @@ def _monthly_expenses_chart(sheet_id: int, n_rows: int) -> dict[str, Any]:
     }
 
 
-def _income_vs_expenses_chart(sheet_id: int, n_rows: int) -> dict[str, Any]:
+def _income_vs_expenses_chart(sheet_id: int, n_rows: int, currency: str = "EUR") -> dict[str, Any]:
     return {
         "addChart": {
             "chart": {
@@ -331,7 +362,7 @@ def _income_vs_expenses_chart(sheet_id: int, n_rows: int) -> dict[str, Any]:
                         "legendPosition": "BOTTOM_LEGEND",
                         "axis": [
                             {"position": "BOTTOM_AXIS", "title": "Month"},
-                            {"position": "LEFT_AXIS", "title": "€"},
+                            {"position": "LEFT_AXIS", "title": currency},
                         ],
                         "domains": [
                             {"domain": {"sourceRange": {"sources": [_range(sheet_id, 1, 3, 1 + n_rows, 4)]}}}

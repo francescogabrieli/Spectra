@@ -1,8 +1,9 @@
-"""Integration test — full pipeline with mocked AI and Sheets."""
+"""CLI adapter tests; actual API commits are covered by service integration tests."""
+
+from __future__ import annotations
 
 from pathlib import Path
-from textwrap import dedent
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,112 +13,127 @@ from spectra.pipeline import run
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    dummy_creds = tmp_path / "dummy.json"
-    dummy_creds.touch()
     return Settings(
-        spreadsheet_id="test-sheet-id",
-        google_sheets_credentials_b64="",
-        google_sheets_credentials_file=str(dummy_creds),
-        ai_provider="gemini",
-        gemini_api_key="test-gemini-key",
-        db_path=tmp_path / "test.db",
-        log_level="DEBUG",
+        service_role="gateway",
+        ai_provider="local",
+        db_path=tmp_path / "runtime" / "spectra.db",
+        import_db_path=tmp_path / "runtime" / "imports.sqlite",
+        fx_db_path=tmp_path / "runtime" / "rates.sqlite",
     )
 
 
 @pytest.fixture
 def csv_file(tmp_path: Path) -> str:
-    csv = tmp_path / "test.csv"
-    csv.write_text(dedent("""\
-        Data Operazione;Descrizione;Importo;Valuta
-        22/02/2026;POS STARBUCKS;-4,50;EUR
-        21/02/2026;ADDEBITO SDD NETFLIX.COM;-9,99;EUR
-    """))
-    return str(csv)
+    path = tmp_path / "synthetic.csv"
+    path.write_text(
+        "Data Operazione;Descrizione;Importo;Valuta\n"
+        "22/02/2026;POS STARBUCKS;-4,50;EUR\n",
+        encoding="utf-8",
+    )
+    return str(path)
 
 
-class TestPipelineIntegration:
+def test_run_uses_import_api_without_opening_ledger(
+    settings: Settings,
+    csv_file: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, bytes, str, bool]] = []
 
-    @patch("spectra.pipeline.SheetsClient")
-    @patch("spectra.pipeline.categorise")
-    def test_full_flow(
-        self,
-        mock_categorise: MagicMock,
-        mock_sheets_cls: MagicMock,
-        settings: Settings,
-        csv_file: str,
-    ) -> None:
-        from spectra.ai import CategorisedTransaction
+    class Client:
+        def __init__(self, _settings: Settings) -> None:
+            pass
 
-        mock_sheets = mock_sheets_cls.return_value
-        mock_sheets.get_existing_categories.return_value = ["Bar & Caffè"]
-        mock_sheets.append_transactions.return_value = 2
+        async def cli_import(self, filename, content, currency, dry_run):
+            calls.append((filename, content, currency, dry_run))
+            return {"ok": True, "dry_run": False, "transaction_count": 1}
 
-        mock_categorise.return_value = [
-            CategorisedTransaction(
-                id="1",
-                original_description="POS STARBUCKS",
-                clean_name="Starbucks",
-                category="Bar & Caffè",
-                amount=-4.50,
-                currency="EUR",
-                date="2026-02-22",
-            ),
-            CategorisedTransaction(
-                id="2",
-                original_description="ADDEBITO SDD NETFLIX.COM",
-                clean_name="Netflix",
-                category="Abbonamenti",
-                amount=-9.99,
-                currency="EUR",
-                date="2026-02-21",
-            ),
-        ]
+    monkeypatch.setattr("spectra.pipeline.ImportClient", Client)
+    run(settings, file=csv_file, currency="EUR", dry_run=False)
 
+    assert calls == [("synthetic.csv", Path(csv_file).read_bytes(), "EUR", False)]
+    assert not settings.db_path.exists()
+
+
+def test_dry_run_writes_only_the_requested_local_preview(
+    settings: Settings,
+    csv_file: str,
+    monkeypatch: pytest.MonkeyPatch,
+    isolate_spectra_runtime: MagicMock,
+) -> None:
+    from spectra.ai import CategorisedTransaction
+
+    row = CategorisedTransaction(
+        id="synthetic-1", original_description="POS SHOP", clean_name="Shop",
+        category="Food", amount=-1.25, currency="EUR", date="2026-02-22",
+    )
+
+    class Client:
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def cli_import(self, *_args):
+            return {"ok": True, "dry_run": True, "transactions": [row.model_dump(mode="json")]}
+
+    monkeypatch.setattr("spectra.pipeline.ImportClient", Client)
+    run(settings, file=csv_file, currency="EUR", dry_run=True)
+
+    report = settings.db_path.parent / "dry_run_report.html"
+    assert report.is_file()
+    assert not settings.db_path.exists()
+    isolate_spectra_runtime.assert_called_once_with(report.as_uri())
+
+
+def test_run_reports_unavailable_local_services(
+    settings: Settings,
+    csv_file: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from spectra.services.clients import ServiceUnavailable
+
+    class Client:
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        async def cli_import(self, *_args):
+            raise ServiceUnavailable("not running")
+
+    monkeypatch.setattr("spectra.pipeline.ImportClient", Client)
+    with pytest.raises(RuntimeError, match="services are not running"):
         run(settings, file=csv_file, currency="EUR", dry_run=False)
 
-        mock_sheets.get_existing_categories.assert_called_once()
-        mock_categorise.assert_called_once()
-        mock_sheets.append_transactions.assert_called_once()
 
-    @patch("spectra.pipeline.SheetsClient")
-    @patch("spectra.pipeline.categorise")
-    def test_dry_run_skips_sheets(
-        self,
-        mock_categorise: MagicMock,
-        mock_sheets_cls: MagicMock,
-        settings: Settings,
-        csv_file: str,
-    ) -> None:
-        from spectra.ai import CategorisedTransaction
+def test_cli_uses_saved_base_currency_from_ledger_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sys
 
-        mock_categorise.return_value = [
-            CategorisedTransaction(
-                id="1",
-                original_description="POS STARBUCKS",
-                clean_name="Starbucks",
-                category="Bar & Caffè",
-                amount=-4.50,
-                currency="EUR",
-                date="2026-02-22",
-            ),
-        ]
+    from spectra import pipeline
 
-        run(settings, file=csv_file, currency="EUR", dry_run=True)
+    settings = Settings(service_role="gateway", ai_provider="local", db_path=tmp_path / "cli.db")
+    run_mock = MagicMock()
 
-        # In dry-run, Sheets should never be instantiated
-        mock_sheets_cls.assert_not_called()
+    class Ledger:
+        def __init__(self, _settings: Settings) -> None:
+            pass
 
-    def test_no_duplicate_imports(self, settings: Settings, csv_file: str) -> None:
-        """Second import should skip already-seen transactions."""
-        from spectra.db import BookmarkDB
-        from spectra.csv_parser import parse_csv
+        def __enter__(self):
+            return self
 
-        txns = parse_csv(csv_file)
-        with BookmarkDB(settings.db_path) as db:
-            db.mark_seen_batch([t.id for t in txns])
+        def __exit__(self, *_args):
+            return None
 
-        # Now run — should detect all as seen and exit early
-        with patch("spectra.pipeline.categorise") as mock_cat:
-            run(settings, file=csv_file, currency="EUR", dry_run=True)
-            mock_cat.assert_not_called()  # AI never called
+        def get_app_setting(self, _key):
+            return "USD"
+
+    monkeypatch.setattr(pipeline, "load_settings", lambda **_kwargs: settings)
+    monkeypatch.setattr(pipeline, "LedgerClient", Ledger)
+    monkeypatch.setattr(pipeline, "run", run_mock)
+    monkeypatch.setattr(sys, "argv", ["spectra", "--file", "statement.csv"])
+
+    pipeline.main()
+
+    run_mock.assert_called_once_with(
+        settings, file="statement.csv", currency="USD", dry_run=False,
+    )

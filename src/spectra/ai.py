@@ -33,6 +33,10 @@ class CategorisedTransaction(BaseModel):
     currency: str
     original_amount: float | None = None
     original_currency: str | None = None
+    conversion_rate: float | None = None
+    conversion_date: str | None = None
+    conversion_source: str = ""
+    conversion_error: str = ""
     date: str
     id: str  # Hash ID for dedup
     statement_category: str = ""
@@ -44,6 +48,12 @@ class CategorisedTransaction(BaseModel):
     needs_review: bool = False
     review_reason: str = ""
     account_name: str = ""
+    account_id: str = ""
+    account_balance: float | None = None
+    account_balance_date: str = ""
+    amount_decimal: str | None = None
+    original_amount_decimal: str | None = None
+    currency_source: str = "parser"
     import_batch_id: str = ""
     transfer_group_id: str = ""
     transfer_status: str = "none"
@@ -77,11 +87,14 @@ CATEGORIZATION RULES — read carefully:
      (Netflix, Spotify, Apple, gym, insurance, phone plans, SaaS).
    - "Salary/Income" for recurring incoming payments (salary, pension).
    - "" (empty string) for one-off transactions.
-6. Reply ONLY with a valid JSON array, no extra text.
+6. Treat id, amount, currency, and date as source data. Return id unchanged.
+   Never calculate, correct, or replace these fields.
+7. Reply ONLY with a valid JSON array, no extra text.
 
 OUTPUT FORMAT (JSON array):
 [
   {
+    "id": "<id copied exactly from input>",
     "original": "<raw description>",
     "clean_name": "<merchant name>",
     "category": "<broad category>",
@@ -110,7 +123,7 @@ def _build_user_prompt(
         counterpart = str(t.get("counterpart", "")).strip()
         counterpart_part = f', controparte: "{counterpart}"' if counterpart else ""
         lines.append(
-            f'- descrizione: "{t["raw_description"]}", '
+            f'- id: "{t.get("id", "")}", descrizione: "{t["raw_description"]}", '
             f'importo: {t["amount"]}, valuta: {t["currency"]}, data: {t["date"]}{counterpart_part}'
         )
 
@@ -184,7 +197,8 @@ def _extract_json(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             pass
 
-    logger.error("Failed to parse LLM response as JSON: %s", text[:300])
+    # Provider output can echo full transaction descriptions; never log it.
+    logger.error("Failed to parse provider output as JSON")
     return []
 
 
@@ -221,7 +235,6 @@ def categorise(
     logger.info(
         "Sending %d transaction(s) to %s (%s)", len(transactions), provider, model
     )
-    logger.debug("Prompt:\n%s", user_prompt)
 
     # Call the provider
     if provider == "gemini":
@@ -231,45 +244,103 @@ def categorise(
     else:
         raise ValueError(f"Unknown AI provider: {provider!r}")
 
-    logger.debug("Raw LLM response:\n%s", raw)
 
     # Parse JSON
     items = _extract_json(raw)
     logger.info("LLM returned %d categorised item(s)", len(items))
 
-    import hashlib
     results: list[CategorisedTransaction] = []
+    by_id = {str(source.get("id")): source for source in transactions if source.get("id")}
+    by_description: dict[str, list[dict[str, Any]]] = {}
+    for source in transactions:
+        by_description.setdefault(str(source.get("raw_description", "")), []).append(source)
+    matched_ids: set[str] = set()
     for item in items:
         try:
-            amount = float(item.get("amount", 0))
-
-            # Create a deterministic ID for dedup (used later in the pipeline)
-            date_str = item.get("date", "")
-            desc_str = item.get("original", "")
-            amount_str = str(amount)
-            raw_id = f"{date_str}:{desc_str}:{amount_str}"
-            txn_id = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()
+            if not isinstance(item, dict):
+                raise ValueError("categorization item must be an object")
+            explicit_id = str(item.get("id", "") or "")
+            source = by_id.get(explicit_id) if explicit_id else None
+            if source is not None:
+                response_description = str(item.get("original", "") or "")
+                if response_description and response_description != str(source.get("raw_description", "")):
+                    logger.warning("Ignoring an AI result whose ID and source description disagree")
+                    continue
+            if source is None:
+                source_description = str(item.get("original", "") or "")
+                candidates = by_description.get(source_description, [])
+                source = next(
+                    (candidate for candidate in candidates if str(candidate.get("id", "")) not in matched_ids),
+                    None,
+                )
+            if source is None:
+                logger.warning("Ignoring unmatched AI categorization result")
+                continue
+            txn_id = str(source.get("id", ""))
+            if not txn_id or txn_id in matched_ids:
+                logger.warning("Ignoring duplicate or unidentified AI categorization result")
+                continue
+            category = str(item.get("category", "") or "").strip()
+            clean_name = str(item.get("clean_name", "") or "").strip()
+            if not category or not clean_name:
+                raise ValueError("categorization output is missing category or merchant")
+            amount = float(source["amount"])
+            desc_str = str(source["raw_description"])
 
             results.append(
                 CategorisedTransaction(
                     id=txn_id,
                     original_description=desc_str,
-                    clean_name=item.get("clean_name", ""),
-                    category=item.get("category", "Other"),
+                    clean_name=clean_name,
+                    category=category,
                     amount=amount,
-                    currency=item.get("currency", base_currency),
-                    date=date_str,
-                    statement_category=str(item.get("statement_category", "") or ""),
+                    amount_decimal=str(source.get("amount_decimal", "") or "") or None,
+                    currency=str(source.get("currency", base_currency)),
+                    date=str(source["date"]),
+                    statement_category=str(source.get("statement_category", "") or ""),
                     recurring=_normalize_recurring(item.get("recurring", ""), amount),
-                    counterpart=str(item.get("counterpart", "") or ""),
-                    # These will be filled by the FX converter in the pipeline if needed
+                    counterpart=str(source.get("counterpart", "") or ""),
                     original_amount=None,
                     original_currency=None,
                     classification_source=provider,
+                    account_name=str(source.get("account_name", "") or ""),
+                    account_id=str(source.get("account_id", "") or ""),
+                    account_balance=source.get("account_balance"),
+                    account_balance_date=str(source.get("account_balance_date", "") or ""),
                 )
             )
+            matched_ids.add(txn_id)
         except Exception:
-            logger.warning("Skipping malformed LLM item: %s", item)
+            logger.warning("Ignoring malformed AI categorization result")
+
+    # An incomplete answer is visible to the user as a review item; it never
+    # causes source rows to disappear or get paired by model-generated numbers.
+    for source in transactions:
+        txn_id = str(source.get("id", ""))
+        if not txn_id or txn_id in matched_ids:
+            continue
+        amount = float(source.get("amount", 0))
+        results.append(
+            CategorisedTransaction(
+                id=txn_id,
+                original_description=str(source.get("raw_description", "")),
+                clean_name=str(source.get("counterpart", "") or source.get("raw_description", "")),
+                category="Uncategorized",
+                amount=amount,
+                amount_decimal=str(source.get("amount_decimal", "") or "") or None,
+                currency=str(source.get("currency", base_currency)),
+                date=str(source.get("date", "")),
+                statement_category=str(source.get("statement_category", "") or ""),
+                counterpart=str(source.get("counterpart", "") or ""),
+                account_name=str(source.get("account_name", "") or ""),
+                classification_source=provider,
+                account_id=str(source.get("account_id", "") or ""),
+                needs_review=True,
+                review_reason="AI response incomplete or did not match this source transaction",
+                account_balance=source.get("account_balance"),
+                account_balance_date=str(source.get("account_balance_date", "") or ""),
+            )
+        )
 
     return results
 

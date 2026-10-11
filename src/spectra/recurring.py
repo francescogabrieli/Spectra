@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # ── Known subscription merchants (lowercase) ─────────────────────
 _SUBSCRIPTION_MERCHANTS = {
@@ -111,7 +112,7 @@ def apply_recurring_tags(
             # Add to running history so subsequent items in the loop see it
             history.setdefault(t.clean_name, []).append((t.date, t.amount))
             continue
-            
+
         # 2. Hybrid Temporal Matching (only for uncategorized)
         if not t.recurring:
             # Get historical entries for this specific merchant

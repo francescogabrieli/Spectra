@@ -1,13 +1,102 @@
+x-spectra-env: &spectra-env
+  AI_PROVIDER: ${AI_PROVIDER:-local}
+  BASE_CURRENCY: ${BASE_CURRENCY:-EUR}
+  DB_PATH: /app/data/spectra.db
+  IMPORT_DB_PATH: /app/staging/imports.sqlite
+  FX_DB_PATH: /app/fx-cache/rates.sqlite
+  LEDGER_URL: http://ledger:8081
+  IMPORT_SERVICE_URL: http://importer:8082
+  ENRICHMENT_URL: http://enrichment:8083
+  INTERNAL_API_TIMEOUT_SECONDS: ${INTERNAL_API_TIMEOUT_SECONDS:-120}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+
 services:
-  spectra:
+  gateway:
     build: .
-    container_name: spectra
+    image: spectra-local:latest
+    container_name: spectra-gateway
+    command: ["uvicorn", "spectra.web.server:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "warning"]
     ports:
-      - "${SPECTRA_PORT:-8080}:8080"
+      - "${SPECTRA_HOST:-127.0.0.1}:${SPECTRA_PORT:-8080}:8080"
     environment:
-      AI_PROVIDER: ${AI_PROVIDER:-local}
+      <<: *spectra-env
+      SPECTRA_SERVICE_ROLE: gateway
+    depends_on:
+      ledger:
+        condition: service_healthy
+      importer:
+        condition: service_healthy
+      enrichment:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2)"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  importer:
+    build: .
+    image: spectra-local:latest
+    container_name: spectra-importer
+    command: ["uvicorn", "spectra.services.importer.app:app", "--host", "0.0.0.0", "--port", "8082", "--log-level", "warning"]
+    environment:
+      <<: *spectra-env
+      SPECTRA_SERVICE_ROLE: importer
+      SPREADSHEET_ID: ${SPREADSHEET_ID:-}
+      GOOGLE_SHEETS_CREDENTIALS_B64: ${GOOGLE_SHEETS_CREDENTIALS_B64:-}
+    volumes:
+      - ./data/import-staging:/app/staging
+    depends_on:
+      ledger:
+        condition: service_healthy
+      enrichment:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/health/ready', timeout=2)"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  ledger:
+    build: .
+    image: spectra-local:latest
+    container_name: spectra-ledger
+    command: ["uvicorn", "spectra.services.ledger.app:app", "--host", "0.0.0.0", "--port", "8081", "--log-level", "warning"]
+    environment:
+      <<: *spectra-env
+      SPECTRA_SERVICE_ROLE: ledger
     volumes:
       - ./data:/app/data
-      - ./inbox:/app/inbox
-      - ./processed:/app/processed
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health/ready', timeout=2)"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  enrichment:
+    build: .
+    image: spectra-local:latest
+    container_name: spectra-enrichment
+    command: ["uvicorn", "spectra.services.enrichment.app:app", "--host", "0.0.0.0", "--port", "8083", "--log-level", "warning"]
+    environment:
+      <<: *spectra-env
+      SPECTRA_SERVICE_ROLE: enrichment
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemma-3-27b-it}
+    volumes:
+      - ./data/enrichment-cache:/app/fx-cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/health/ready', timeout=2)"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped

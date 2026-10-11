@@ -171,6 +171,38 @@ class TestParseCsv:
         txns2 = parse_csv(fixture)
         assert [tx.id for tx in txns1] == [tx.id for tx in txns2]
 
+    def test_identity_scopes_accounts_currencies_and_repeated_postings(self, tmp_path: Path) -> None:
+        statement = tmp_path / "all.csv"
+        statement.write_text(
+            "Date,Description,Amount,Currency,Account\n"
+            "2026-02-22,MARKET,-10.00,EUR,Checking A\n"
+            "2026-02-22,MARKET,-10.00,EUR,Checking A\n"
+            "2026-02-22,MARKET,-10.00,EUR,Checking B\n"
+            "2026-02-22,MARKET,-10.00,USD,Checking A\n"
+        )
+
+        first = parse_csv(statement)
+        again = parse_csv(statement)
+        assert len(first) == 4
+        assert len({tx.id for tx in first}) == 4
+        assert [tx.id for tx in first] == [tx.id for tx in again]
+        assert first[0].account_id != first[2].account_id
+        assert first[0].id != first[1].id
+        assert first[0].id != first[3].id
+        assert first[0].legacy_id == first[2].legacy_id
+
+    def test_overlapping_duplicate_rows_keep_occurrence_identity(self, tmp_path: Path) -> None:
+        full = tmp_path / "full.csv"
+        overlap = tmp_path / "overlap.csv"
+        header = "Date,Description,Amount,Currency,Account\n"
+        duplicate = "2026-02-22,MARKET,-10.00,EUR,Checking A\n"
+        full.write_text(header + duplicate + duplicate + "2026-02-23,COFFEE,-3.00,EUR,Checking A\n")
+        overlap.write_text(header + duplicate + duplicate)
+
+        full_rows = parse_csv(full)
+        overlap_rows = parse_csv(overlap)
+        assert [row.id for row in overlap_rows] == [row.id for row in full_rows[:2]]
+
     def test_file_not_found(self) -> None:
         with pytest.raises(FileNotFoundError):
             parse_csv("/nonexistent/file.csv")

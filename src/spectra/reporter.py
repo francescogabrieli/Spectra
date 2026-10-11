@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import webbrowser
+from html import escape
 from pathlib import Path
 from typing import Any
+
+from spectra.money import decimal_text
 
 logger = logging.getLogger("spectra.reporter")
 
@@ -18,6 +21,10 @@ def generate_html_report(transactions: list[Any], output_dir: str | Path = "data
     for t in transactions:
         amount_class = "positive" if t.amount > 0 else "negative"
         sign = "+" if t.amount > 0 else ""
+        currency = str(getattr(t, "currency", "") or "EUR").upper()
+        amount_text = decimal_text(
+            getattr(t, "amount_decimal", None) or t.amount, currency,
+        )
         
         # Tags formatting
         tag_html = ""
@@ -29,18 +36,26 @@ def generate_html_report(transactions: list[Any], output_dir: str | Path = "data
         # FX String
         fx_html = ""
         if t.original_amount is not None:
-            fx_html = f'<div class="fx-note">Converted from {t.original_amount:.2f} {t.original_currency}</div>'
+            original_currency = str(t.original_currency or currency).upper()
+            original_amount = decimal_text(
+                getattr(t, "original_amount_decimal", None) or t.original_amount,
+                original_currency,
+            )
+            fx_html = (
+                f'<div class="fx-note">Converted from {escape(original_amount)} '
+                f'{escape(original_currency)}</div>'
+            )
 
         row = f"""
         <tr>
-            <td class="mono">{t.date}</td>
+            <td class="mono">{escape(str(t.date))}</td>
             <td>
-                <div style="font-weight: 500;">{t.clean_name} {tag_html}</div>
+                <div style="font-weight: 500;">{escape(str(t.clean_name))} {tag_html}</div>
             </td>
-            <td class="original-desc">{t.original_description}</td>
-            <td><span class="tag">{t.category}</span></td>
+            <td class="original-desc">{escape(str(t.original_description))}</td>
+            <td><span class="tag">{escape(str(t.category))}</span></td>
             <td class="mono amount {amount_class}" style="text-align: right;">
-                {sign}{t.amount:.2f} {t.currency}
+                {sign}{escape(amount_text)} {escape(currency)}
                 {fx_html}
             </td>
         </tr>

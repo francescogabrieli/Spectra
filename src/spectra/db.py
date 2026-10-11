@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
+
+from spectra.money import as_decimal, decimal_text, minor_units
 
 logger = logging.getLogger("spectra.db")
 
@@ -21,6 +25,9 @@ CREATE TABLE IF NOT EXISTS tx_history (
     date        TEXT NOT NULL,
     clean_name  TEXT NOT NULL,
     amount      REAL NOT NULL,
+    amount_currency TEXT,
+    amount_decimal TEXT,
+    amount_minor INTEGER,
     category    TEXT NOT NULL DEFAULT 'Uncategorized',
     original_description TEXT NOT NULL DEFAULT '',
     counterpart TEXT NOT NULL DEFAULT '',
@@ -35,7 +42,35 @@ CREATE TABLE IF NOT EXISTS tx_history (
     transfer_status TEXT NOT NULL DEFAULT 'none',
     excluded_from_spend INTEGER NOT NULL DEFAULT 0,
     original_amount REAL,
-    original_currency TEXT
+    original_currency TEXT,
+    original_amount_decimal TEXT,
+    original_amount_minor INTEGER,
+    conversion_rate REAL,
+    conversion_date TEXT,
+    conversion_source TEXT NOT NULL DEFAULT '',
+    conversion_error TEXT NOT NULL DEFAULT '',
+    currency_source TEXT NOT NULL DEFAULT '',
+    account_id TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL,
+    balance REAL,
+    balance_decimal TEXT,
+    balance_as_of TEXT,
+    balance_source TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS fx_rates (
+    rate_date TEXT NOT NULL,
+    base_currency TEXT NOT NULL,
+    quote_currency TEXT NOT NULL,
+    rate TEXT NOT NULL,
+    effective_date TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    PRIMARY KEY (rate_date, base_currency, quote_currency)
 );
 
 CREATE TABLE IF NOT EXISTS user_overrides (
@@ -51,7 +86,9 @@ CREATE TABLE IF NOT EXISTS merchant_categories (
 
 CREATE TABLE IF NOT EXISTS budget_limits (
     category    TEXT PRIMARY KEY,
-    monthly_limit REAL NOT NULL
+    monthly_limit REAL NOT NULL,
+    limit_currency TEXT,
+    limit_decimal TEXT
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -79,6 +116,12 @@ CREATE TABLE IF NOT EXISTS learning_feedback (
     apply_to_future     INTEGER NOT NULL DEFAULT 1,
     created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS import_commits (
+    idempotency_key TEXT PRIMARY KEY,
+    result_json TEXT NOT NULL,
+    committed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 _TX_HISTORY_COLUMN_DEFS: dict[str, str] = {
@@ -97,6 +140,17 @@ _TX_HISTORY_COLUMN_DEFS: dict[str, str] = {
     "excluded_from_spend": "INTEGER NOT NULL DEFAULT 0",
     "original_amount": "REAL",
     "original_currency": "TEXT",
+    "amount_currency": "TEXT",
+    "amount_decimal": "TEXT",
+    "amount_minor": "INTEGER",
+    "original_amount_decimal": "TEXT",
+    "original_amount_minor": "INTEGER",
+    "conversion_rate": "REAL",
+    "conversion_date": "TEXT",
+    "conversion_source": "TEXT NOT NULL DEFAULT ''",
+    "conversion_error": "TEXT NOT NULL DEFAULT ''",
+    "currency_source": "TEXT NOT NULL DEFAULT ''",
+    "account_id": "TEXT NOT NULL DEFAULT ''",
 }
 
 _TX_HISTORY_SELECT_COLUMNS = """
@@ -118,7 +172,18 @@ transfer_group_id,
 transfer_status,
 excluded_from_spend,
 original_amount,
-original_currency
+original_currency,
+amount_currency,
+amount_decimal,
+amount_minor,
+original_amount_decimal,
+original_amount_minor,
+conversion_rate,
+conversion_date,
+conversion_source,
+conversion_error,
+currency_source,
+account_id
 """
 
 
@@ -144,13 +209,34 @@ class BookmarkDB:
             if column in existing_columns:
                 continue
             self._conn.execute(f"ALTER TABLE tx_history ADD COLUMN {column} {definition}")
+        # Currency of the stored amount is authoritative. Historical rows are
+        # left unknown unless they already carry an explicit currency field;
+        # the current preference is not proof of the currency used at import.
+        self._conn.execute(
+            "UPDATE tx_history SET currency_source = 'legacy-unknown' "
+            "WHERE amount_currency IS NULL AND currency_source = ''"
+        )
+        self._conn.execute(
+            """UPDATE tx_history SET needs_review = 1,
+               review_reason = 'legacy_currency_unknown'
+               WHERE amount_currency IS NULL AND currency_source = 'legacy-unknown'"""
+        )
         # budget_limits table (for existing DBs pre-budget feature)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS budget_limits (
                 category      TEXT PRIMARY KEY,
-                monthly_limit REAL NOT NULL
+                monthly_limit REAL NOT NULL,
+                limit_currency TEXT,
+                limit_decimal TEXT
             )
         """)
+        budget_columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(budget_limits)").fetchall()
+        }
+        for column in ("limit_currency", "limit_decimal"):
+            if column not in budget_columns:
+                self._conn.execute(f"ALTER TABLE budget_limits ADD COLUMN {column} TEXT")
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key   TEXT PRIMARY KEY,
@@ -188,6 +274,8 @@ class BookmarkDB:
             CREATE INDEX IF NOT EXISTS idx_tx_history_account_name ON tx_history(account_name);
             CREATE INDEX IF NOT EXISTS idx_tx_history_transfer_status ON tx_history(transfer_status);
             CREATE INDEX IF NOT EXISTS idx_tx_history_import_batch ON tx_history(import_batch_id);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_currency_date ON tx_history(amount_currency, date);
+            CREATE INDEX IF NOT EXISTS idx_tx_history_account_id ON tx_history(account_id);
             """
         )
         self._conn.commit()
@@ -214,6 +302,17 @@ class BookmarkDB:
             "excluded_from_spend": bool(row[16]),
             "original_amount": float(row[17]) if row[17] is not None else None,
             "original_currency": str(row[18] or "") or None,
+            "currency": str(row[19] or "") or None,
+            "amount_decimal": str(row[20] or "") or None,
+            "amount_minor": int(row[21]) if row[21] is not None else None,
+            "original_amount_decimal": str(row[22] or "") or None,
+            "original_amount_minor": int(row[23]) if row[23] is not None else None,
+            "conversion_rate": float(row[24]) if row[24] is not None else None,
+            "conversion_date": str(row[25] or "") or None,
+            "conversion_source": str(row[26] or ""),
+            "conversion_error": str(row[27] or ""),
+            "currency_source": str(row[28] or ""),
+            "account_id": str(row[29] or ""),
         }
 
     # ── Transaction dedup ────────────────────────────────────────
@@ -254,60 +353,306 @@ class BookmarkDB:
 
     # ── History tracking for Recurring Detection ─────────────────
 
-    def save_history(self, transactions: list[Any]) -> None:
-        """Save a batch of parsed and ML-categorised transactions to history."""
-        self._conn.executemany(
-            """
-            INSERT OR REPLACE INTO tx_history (
-                tx_id,
-                date,
-                clean_name,
-                amount,
-                category,
-                original_description,
-                counterpart,
-                recurring,
-                classification_source,
-                category_confidence,
-                needs_review,
-                review_reason,
-                account_name,
-                import_batch_id,
-                transfer_group_id,
-                transfer_status,
-                excluded_from_spend,
-                original_amount,
-                original_currency
+    def _write_history_rows(self, transactions: list[Any]) -> None:
+        from datetime import datetime, timezone
+
+        columns = """
+            tx_id, date, clean_name, amount, amount_currency, amount_decimal, amount_minor,
+            category, original_description, counterpart, recurring, classification_source,
+            category_confidence, needs_review, review_reason, account_name, import_batch_id,
+            transfer_group_id, transfer_status, excluded_from_spend, original_amount,
+            original_currency, original_amount_decimal, original_amount_minor,
+            conversion_rate, conversion_date, conversion_source, conversion_error,
+            currency_source, account_id
+        """
+        placeholders = ", ".join("?" for _ in range(30))
+        rows = []
+        account_rows: dict[str, tuple[Any, ...]] = {}
+        for tx in transactions:
+            amount_currency = str(
+                getattr(tx, "currency", None)
+                or getattr(tx, "amount_currency", None)
+                or self.get_app_setting("base_currency")
+                or "EUR"
+            ).upper()
+            amount_text = decimal_text(
+                getattr(tx, "amount_decimal", None) or getattr(tx, "amount"),
+                amount_currency,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    t.id,
-                    t.date,
-                    t.clean_name,
-                    t.amount,
-                    getattr(t, "category", "Uncategorized"),
-                    getattr(t, "original_description", ""),
-                    getattr(t, "counterpart", ""),
-                    getattr(t, "recurring", ""),
-                    getattr(t, "classification_source", ""),
-                    getattr(t, "category_confidence", None),
-                    1 if getattr(t, "needs_review", False) else 0,
-                    getattr(t, "review_reason", ""),
-                    getattr(t, "account_name", ""),
-                    getattr(t, "import_batch_id", ""),
-                    getattr(t, "transfer_group_id", ""),
-                    getattr(t, "transfer_status", "none") or "none",
-                    1 if getattr(t, "excluded_from_spend", False) else 0,
-                    getattr(t, "original_amount", None),
-                    getattr(t, "original_currency", None),
+            raw_original_amount = getattr(tx, "original_amount", None)
+            original_currency = getattr(tx, "original_currency", None)
+            original_text = (
+                decimal_text(
+                    getattr(tx, "original_amount_decimal", None) or raw_original_amount,
+                    original_currency,
                 )
-                for t in transactions
-            ],
-        )
-        # Also mark them as seen
-        self.mark_seen_batch([t.id for t in transactions])
+                if raw_original_amount is not None and original_currency
+                else None
+            )
+            account_id = str(getattr(tx, "account_id", "") or "")
+            account_name = str(getattr(tx, "account_name", "") or "")
+            account_balance = getattr(tx, "account_balance", None)
+            account_balance_date = str(getattr(tx, "account_balance_date", "") or "")
+            if account_name and not account_id:
+                account_id = "acct-" + hashlib.sha256(
+                    f"{account_name.casefold()}|{amount_currency}".encode("utf-8")
+                ).hexdigest()[:20]
+            if account_id:
+                balance_text = (
+                    decimal_text(account_balance, amount_currency)
+                    if account_balance is not None
+                    else None
+                )
+                account_rows[account_id] = (
+                    account_id, account_name, amount_currency,
+                    float(account_balance) if account_balance is not None else None,
+                    balance_text, account_balance_date or None,
+                    "statement" if account_balance is not None else "",
+                )
+            rows.append((
+                str(tx.id), str(tx.date), str(tx.clean_name), float(tx.amount),
+                amount_currency, amount_text, minor_units(amount_text, amount_currency),
+                str(getattr(tx, "category", "Uncategorized") or "Uncategorized"),
+                str(getattr(tx, "original_description", "") or ""),
+                str(getattr(tx, "counterpart", "") or ""),
+                str(getattr(tx, "recurring", "") or ""),
+                str(getattr(tx, "classification_source", "") or ""),
+                getattr(tx, "category_confidence", None),
+                1 if getattr(tx, "needs_review", False) else 0,
+                str(getattr(tx, "review_reason", "") or ""),
+                account_name, str(getattr(tx, "import_batch_id", "") or ""),
+                str(getattr(tx, "transfer_group_id", "") or ""),
+                str(getattr(tx, "transfer_status", "none") or "none"),
+                1 if getattr(tx, "excluded_from_spend", False) else 0,
+                float(raw_original_amount) if raw_original_amount is not None else None,
+                str(original_currency or "") or None, original_text,
+                minor_units(original_text, original_currency) if original_text else None,
+                getattr(tx, "conversion_rate", None), getattr(tx, "conversion_date", None),
+                str(getattr(tx, "conversion_source", "") or ""),
+                str(getattr(tx, "conversion_error", "") or ""),
+                str(getattr(tx, "currency_source", "parser") or "parser"), account_id,
+            ))
+
+        if rows:
+            self._conn.executemany(
+                f"INSERT OR REPLACE INTO tx_history ({columns}) VALUES ({placeholders})", rows,
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO seen_transactions (tx_id, source, seen_at) VALUES (?, ?, ?)",
+                [(row[0], "IMPORT", now) for row in rows],
+            )
+        for row in account_rows.values():
+            self._conn.execute(
+                """INSERT INTO accounts (
+                    account_id, display_name, currency, balance, balance_decimal,
+                    balance_as_of, balance_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    display_name = CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE accounts.display_name END,
+                    currency = excluded.currency,
+                    balance = CASE WHEN excluded.balance IS NOT NULL THEN excluded.balance ELSE accounts.balance END,
+                    balance_decimal = CASE WHEN excluded.balance_decimal IS NOT NULL THEN excluded.balance_decimal ELSE accounts.balance_decimal END,
+                    balance_as_of = CASE WHEN excluded.balance_as_of IS NOT NULL THEN excluded.balance_as_of ELSE accounts.balance_as_of END,
+                    balance_source = CASE WHEN excluded.balance_source != '' THEN excluded.balance_source ELSE accounts.balance_source END
+                """,
+                row,
+            )
+
+    def save_history(self, transactions: list[Any]) -> None:
+        """Save rows, account metadata, and idempotency markers atomically."""
+        with self._conn:
+            self._write_history_rows(transactions)
+
+    def save_import_atomic(
+        self,
+        transactions: list[Any],
+        *,
+        learning_feedback: list[dict[str, Any]] | None = None,
+        merchant_mappings: dict[str, str] | None = None,
+        overrides: dict[str, dict[str, str]] | None = None,
+        existing_transfer_updates: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Commit an accepted import and its learning side effects in one transaction."""
+        with self._conn:
+            self._write_import_side_effects(
+                transactions,
+                learning_feedback=learning_feedback,
+                merchant_mappings=merchant_mappings,
+                overrides=overrides,
+                existing_transfer_updates=existing_transfer_updates,
+            )
+
+    def _write_import_side_effects(
+        self,
+        transactions: list[Any],
+        *,
+        learning_feedback: list[dict[str, Any]] | None,
+        merchant_mappings: dict[str, str] | None,
+        overrides: dict[str, dict[str, str]] | None,
+        existing_transfer_updates: list[dict[str, Any]] | None,
+    ) -> None:
+        self._write_history_rows(transactions)
+        for update in existing_transfer_updates or []:
+            fields = {key: value for key, value in update.items() if key != "tx_id"}
+            if fields:
+                assignments = ", ".join(f"{key} = ?" for key in fields)
+                self._conn.execute(
+                    f"UPDATE tx_history SET {assignments} WHERE tx_id = ?",
+                    [*fields.values(), str(update["tx_id"])],
+                )
+        if merchant_mappings:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO merchant_categories (clean_name, category) VALUES (?, ?)",
+                list(merchant_mappings.items()),
+            )
+        if overrides:
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO user_overrides
+                   (original_description, category, clean_name) VALUES (?, ?, ?)""",
+                [(desc, value.get("category", ""), value.get("clean_name", ""))
+                 for desc, value in overrides.items()],
+            )
+        for feedback in learning_feedback or []:
+            self._conn.execute(
+                """INSERT INTO learning_feedback (
+                    tx_id, original_description, clean_name, category, source, apply_to_future
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    feedback.get("tx_id"), feedback.get("original_description", ""),
+                    feedback.get("clean_name", ""), feedback.get("category", ""),
+                    feedback.get("source", "upload_confirm"),
+                    1 if feedback.get("apply_to_future", True) else 0,
+                ),
+            )
+
+    def commit_import_once(
+        self,
+        idempotency_key: str,
+        transactions: list[Any],
+        *,
+        learning_feedback: list[dict[str, Any]] | None = None,
+        merchant_mappings: dict[str, str] | None = None,
+        overrides: dict[str, dict[str, str]] | None = None,
+        existing_transfer_updates: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically commit financial rows and an idempotent retry receipt."""
+        key = str(idempotency_key).strip()
+        if not key or len(key) > 200:
+            raise ValueError("A non-empty import idempotency key is required")
+        with self._conn:
+            existing = self._conn.execute(
+                "SELECT result_json FROM import_commits WHERE idempotency_key = ?", (key,),
+            ).fetchone()
+            if existing:
+                result = json.loads(str(existing[0]))
+                return {**result, "already_committed": True}
+            self._write_import_side_effects(
+                transactions,
+                learning_feedback=learning_feedback,
+                merchant_mappings=merchant_mappings,
+                overrides=overrides,
+                existing_transfer_updates=existing_transfer_updates,
+            )
+            result = {"ok": True, "transaction_count": len(transactions)}
+            self._conn.execute(
+                "INSERT INTO import_commits (idempotency_key, result_json) VALUES (?, ?)",
+                (key, json.dumps(result, separators=(",", ":"))),
+            )
+        return {**result, "already_committed": False}
+
+    def list_known_categories(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT category FROM tx_history WHERE category != 'Uncategorized' ORDER BY category"
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def read_model(self, name: str, **params: Any) -> Any:
+        """Return allowlisted read models used by the gateway; no SQL crosses HTTP."""
+        if name == "transaction_count":
+            return int(self._conn.execute("SELECT COUNT(*) FROM tx_history").fetchone()[0])
+        if name == "categories":
+            return self.list_known_categories()
+        if name == "setup_summary":
+            return {
+                "transaction_count": int(self._conn.execute("SELECT COUNT(*) FROM tx_history").fetchone()[0]),
+                "legacy_currency_count": int(self._conn.execute(
+                    "SELECT COUNT(*) FROM tx_history WHERE amount_currency IS NULL AND currency_source = 'legacy-unknown'"
+                ).fetchone()[0]),
+                "merchant_count": int(self._conn.execute("SELECT COUNT(*) FROM merchant_categories").fetchone()[0]),
+                "feedback_count": int(self._conn.execute("SELECT COUNT(*) FROM learning_feedback").fetchone()[0]),
+                "active_rule_count": int(self._conn.execute("SELECT COUNT(*) FROM category_rules WHERE is_active = 1").fetchone()[0]),
+                "categories": self.list_known_categories(),
+            }
+        if name == "learning_summary":
+            return {
+                "feedback_count": int(self._conn.execute("SELECT COUNT(*) FROM learning_feedback").fetchone()[0]),
+                "override_count": int(self._conn.execute("SELECT COUNT(*) FROM user_overrides").fetchone()[0]),
+                "uncategorized_count": int(self._conn.execute("SELECT COUNT(*) FROM tx_history WHERE category = 'Uncategorized'").fetchone()[0]),
+                "learned_future_count": int(self._conn.execute("SELECT COUNT(*) FROM learning_feedback WHERE apply_to_future = 1").fetchone()[0]),
+            }
+        if name == "transaction_merchants":
+            ids = [str(value) for value in params.get("ids", [])]
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            rows = self._conn.execute(
+                f"SELECT tx_id, clean_name, original_description FROM tx_history WHERE tx_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            return [list(row) for row in rows]
+        if name == "rule_impact_rows":
+            return [list(row) for row in self._conn.execute(
+                "SELECT tx_id, date, clean_name, original_description, category FROM tx_history ORDER BY date DESC, tx_id DESC"
+            ).fetchall()]
+        currency = str(params.get("currency", "")).upper()
+        if name == "summary_rows":
+            return [list(row) for row in self._conn.execute(
+                """SELECT date, clean_name, COALESCE(amount_decimal, CAST(amount AS TEXT)), category
+                   FROM tx_history WHERE excluded_from_spend = 0 AND amount_currency = ? ORDER BY date DESC""",
+                (currency,),
+            ).fetchall()]
+        if name == "summary_non_base_count":
+            return int(self._conn.execute(
+                """SELECT COUNT(*) FROM tx_history WHERE excluded_from_spend = 0 AND date >= ? AND date < ?
+                   AND (amount_currency IS NULL OR amount_currency != ?)""",
+                (str(params["start"]), str(params["end"]), currency),
+            ).fetchone()[0])
+        if name == "budget_expense_rows":
+            return [list(row) for row in self._conn.execute(
+                """SELECT category, amount_decimal, amount FROM tx_history
+                   WHERE amount < 0 AND excluded_from_spend = 0 AND date >= ? AND date < ? AND amount_currency = ?""",
+                (str(params["start"]), str(params["end"]), currency),
+            ).fetchall()]
+        if name == "budget_categories":
+            return [str(row[0]) for row in self._conn.execute(
+                """SELECT DISTINCT category FROM tx_history
+                   WHERE category != 'Uncategorized' AND amount < 0 AND excluded_from_spend = 0 AND amount_currency = ?
+                   ORDER BY category""", (currency,),
+            ).fetchall()]
+        if name == "currency_count":
+            return int(self._conn.execute(
+                """SELECT COUNT(*) FROM tx_history WHERE excluded_from_spend = 0 AND date >= ? AND date < ?
+                   AND (amount_currency IS NULL OR amount_currency != ?)""",
+                (str(params["start"]), str(params["end"]), currency),
+            ).fetchone()[0])
+        if name == "all_time_currency_count":
+            return int(self._conn.execute(
+                """SELECT COUNT(*) FROM tx_history WHERE excluded_from_spend = 0
+                   AND (amount_currency IS NULL OR amount_currency != ?)""", (currency,),
+            ).fetchone()[0])
+        if name == "trend_rows":
+            return [list(row) for row in self._conn.execute(
+                """SELECT date, COALESCE(amount_decimal, CAST(amount AS TEXT)), category FROM tx_history
+                   WHERE excluded_from_spend = 0 AND amount_currency = ? ORDER BY date ASC""", (currency,),
+            ).fetchall()]
+        if name == "subscription_rows":
+            return [list(row) for row in self._conn.execute(
+                """SELECT date, clean_name, COALESCE(amount_decimal, CAST(amount AS TEXT)), category,
+                          COALESCE(original_description, '') FROM tx_history
+                   WHERE excluded_from_spend = 0 AND amount_currency = ? ORDER BY date ASC""", (currency,),
+            ).fetchall()]
+        raise ValueError(f"Unknown ledger read model: {name}")
 
     def get_merchant_history(self) -> dict[str, list[tuple[str, float]]]:
         """Fetch all historical transactions grouped by merchant clean_name."""
@@ -595,6 +940,7 @@ class BookmarkDB:
         *,
         tx_date: str,
         amount: float,
+        currency: str | None = None,
         exclude_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return nearby same-amount rows that could form a transfer pair."""
@@ -613,6 +959,9 @@ class BookmarkDB:
             "excluded_from_spend = 0",
         ]
         params: list[Any] = [date_from, date_to, abs(amount)]
+        if currency:
+            where.append("amount_currency = ?")
+            params.append(str(currency).upper())
         if exclude_ids:
             placeholders = ",".join("?" for _ in exclude_ids)
             where.append(f"tx_id NOT IN ({placeholders})")
@@ -656,16 +1005,48 @@ class BookmarkDB:
 
     # ── Budget Limits ───────────────────────────────────────────
 
-    def get_budget_limits(self) -> dict[str, float]:
-        """Return all category→monthly_limit mappings."""
-        rows = self._conn.execute("SELECT category, monthly_limit FROM budget_limits").fetchall()
-        return {cat: lim for cat, lim in rows}
+    def get_budget_limits(self, currency: str | None = None) -> dict[str, float]:
+        """Return configured limits, optionally restricted to one denomination."""
+        if currency:
+            rows = self._conn.execute(
+                """SELECT category, COALESCE(limit_decimal, CAST(monthly_limit AS TEXT))
+                   FROM budget_limits WHERE limit_currency = ?""",
+                (currency.upper(),),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT category, COALESCE(limit_decimal, CAST(monthly_limit AS TEXT))
+                   FROM budget_limits"""
+            ).fetchall()
+        return {str(category): float(as_decimal(amount)) for category, amount in rows}
 
-    def save_budget_limit(self, category: str, monthly_limit: float) -> None:
-        """Save or update the monthly budget limit for a category."""
+    def get_budget_limits_exact(self, currency: str) -> dict[str, Any]:
+        """Return exact Decimal budget values for one denomination."""
+        rows = self._conn.execute(
+            """SELECT category, COALESCE(limit_decimal, CAST(monthly_limit AS TEXT))
+               FROM budget_limits WHERE limit_currency = ?""",
+            (currency.upper(),),
+        ).fetchall()
+        return {str(category): as_decimal(amount) for category, amount in rows}
+
+    def count_non_base_budget_limits(self, currency: str) -> int:
+        row = self._conn.execute(
+            """SELECT COUNT(*) FROM budget_limits
+               WHERE limit_currency IS NULL OR limit_currency != ?""",
+            (currency.upper(),),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def save_budget_limit(
+        self, category: str, monthly_limit: float, currency: str = "EUR",
+    ) -> None:
+        """Save an exact, denomination-scoped monthly budget limit."""
+        code = str(currency).strip().upper()
+        amount_text = decimal_text(monthly_limit, code)
         self._conn.execute(
-            "INSERT OR REPLACE INTO budget_limits (category, monthly_limit) VALUES (?, ?)",
-            (category, monthly_limit),
+            """INSERT OR REPLACE INTO budget_limits
+               (category, monthly_limit, limit_currency, limit_decimal) VALUES (?, ?, ?, ?)""",
+            (category, float(as_decimal(monthly_limit)), code, amount_text),
         )
         self._conn.commit()
 
@@ -684,6 +1065,129 @@ class BookmarkDB:
             (key, value),
         )
         self._conn.commit()
+
+    def get_fx_rate(self, rate_date: str, base: str, quote: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT rate, effective_date, provider FROM fx_rates
+               WHERE rate_date = ? AND base_currency = ? AND quote_currency = ?""",
+            (rate_date, base, quote),
+        ).fetchone()
+        if not row:
+            return None
+        return {"rate": row[0], "effective_date": row[1], "provider": row[2]}
+
+    def save_fx_rate(
+        self, rate_date: str, base: str, quote: str, rate: str,
+        effective_date: str, provider: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR REPLACE INTO fx_rates
+               (rate_date, base_currency, quote_currency, rate, effective_date, provider)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (rate_date, base, quote, rate, effective_date, provider),
+        )
+        self._conn.commit()
+
+    def find_legacy_transaction(self, tx_id: str) -> dict[str, Any] | None:
+        """Look up old unscoped IDs while preserving account-aware re-imports."""
+        return self.get_transaction(tx_id)
+
+    def list_legacy_unknown_currency(self, *, page: int = 1, per_page: int = 50) -> dict[str, Any]:
+        """List historical transactions whose amount denomination was never stored."""
+        where = "amount_currency IS NULL AND currency_source = 'legacy-unknown'"
+        total_row = self._conn.execute(
+            f"SELECT COUNT(*) FROM tx_history WHERE {where}"
+        ).fetchone()
+        total = int(total_row[0] if total_row else 0)
+        rows = self._conn.execute(
+            f"""SELECT tx_id, date, clean_name, amount, category, account_name,
+                       original_description, needs_review, review_reason
+                FROM tx_history WHERE {where}
+                ORDER BY date DESC, tx_id DESC LIMIT ? OFFSET ?""",
+            (per_page, max(page - 1, 0) * per_page),
+        ).fetchall()
+        return {
+            "items": [
+                {
+                    "id": str(row[0]), "date": str(row[1]), "merchant": str(row[2]),
+                    "amount": float(row[3]), "category": str(row[4]),
+                    "account_name": str(row[5] or ""),
+                    "original_description": str(row[6] or ""),
+                    "needs_review": bool(row[7]), "review_reason": str(row[8] or ""),
+                }
+                for row in rows
+            ],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, (total + per_page - 1) // per_page),
+        }
+
+    def confirm_legacy_currencies(self, confirmations: list[dict[str, Any]]) -> int:
+        """Attach user-confirmed denominations without changing stored amounts."""
+        import re
+
+        if not confirmations:
+            raise ValueError("At least one transaction currency confirmation is required")
+        normalized: dict[str, tuple[str, str | None]] = {}
+        for item in confirmations:
+            tx_id = str(item.get("id") or "").strip()
+            currency = str(item.get("currency") or "").strip().upper()
+            if not tx_id or not re.fullmatch(r"[A-Z]{3}", currency):
+                raise ValueError("Each item must include a transaction id and 3-letter currency code")
+            if tx_id in normalized:
+                raise ValueError("Transaction ids must be unique")
+            amount_override = item.get("amount_decimal")
+            amount_override = str(amount_override).strip() if amount_override is not None else None
+            normalized[tx_id] = (currency, amount_override or None)
+
+        with self._conn:
+            placeholders = ",".join("?" for _ in normalized)
+            rows = self._conn.execute(
+                f"""SELECT tx_id, amount, review_reason FROM tx_history
+                    WHERE tx_id IN ({placeholders}) AND amount_currency IS NULL
+                      AND currency_source = 'legacy-unknown'""",
+                list(normalized),
+            ).fetchall()
+            if len(rows) != len(normalized):
+                raise ValueError("One or more transactions are no longer awaiting currency confirmation")
+            for tx_id, amount, review_reason in rows:
+                currency, amount_override = normalized[str(tx_id)]
+                exact_amount = as_decimal(amount_override if amount_override is not None else amount)
+                amount_text = decimal_text(exact_amount, currency)
+                if as_decimal(amount_text) != exact_amount:
+                    raise ValueError(
+                        f"Transaction {tx_id} has precision not supported by {currency}; provide amount_decimal explicitly"
+                    )
+                is_currency_review = str(review_reason or "") == "legacy_currency_unknown"
+                self._conn.execute(
+                    """UPDATE tx_history SET amount = ?, amount_currency = ?, amount_decimal = ?,
+                           amount_minor = ?, currency_source = 'user-confirmed',
+                           needs_review = CASE WHEN ? THEN 0 ELSE needs_review END,
+                           review_reason = CASE WHEN ? THEN '' ELSE review_reason END
+                       WHERE tx_id = ?""",
+                    (
+                        float(amount_text), currency, amount_text, minor_units(amount_text, currency),
+                        int(is_currency_review), int(is_currency_review), str(tx_id),
+                    ),
+                )
+        return len(normalized)
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT account_id, display_name, currency, balance,
+                      balance_decimal, balance_as_of, balance_source
+               FROM accounts ORDER BY display_name, account_id"""
+        ).fetchall()
+        return [
+            {
+                "account_id": row[0], "name": row[1], "currency": row[2],
+                "balance": float(row[3]) if row[3] is not None else None,
+                "balance_decimal": row[4], "balance_as_of": row[5],
+                "balance_source": row[6],
+            }
+            for row in rows
+        ]
 
     # ── Category Rules ─────────────────────────────────────────
 
@@ -1081,6 +1585,7 @@ class BookmarkDB:
         tables = [
             "tx_history",
             "seen_transactions",
+            "accounts",
             "merchant_categories",
             "user_overrides",
             "budget_limits",

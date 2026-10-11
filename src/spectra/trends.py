@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from spectra.money import as_decimal, quantize_money
 
 logger = logging.getLogger("spectra.trends")
 
@@ -15,18 +18,19 @@ _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 # ── Data computation ──────────────────────────────────────────────
 
-def _get_col_indices(rows: list[list[str]]) -> tuple[int, int] | None:
-    """Return (date_col, amount_col) from header, or None if not found."""
+def _get_col_indices(rows: list[list[str]]) -> tuple[int, int, int] | None:
+    """Return date, amount, and denomination columns, or None if not found."""
     header = [h.strip().lower() for h in rows[0]]
     try:
-        return header.index("date"), header.index("amount")
+        return header.index("date"), header.index("amount"), header.index("currency")
     except ValueError:
-        logger.warning("Could not find date/amount columns")
+        logger.warning("Could not find date/amount/currency columns")
         return None
 
 
 def compute_monthly_data(
     rows: list[list[str]],
+    base_currency: str = "EUR",
 ) -> dict[int, dict[int, dict[str, float]]]:
     """Compute monthly income, expenses, net cash flow and savings rate by year/month.
 
@@ -44,26 +48,30 @@ def compute_monthly_data(
     cols = _get_col_indices(rows)
     if cols is None:
         return {}
-    date_col, amount_col = cols
+    date_col, amount_col, currency_col = cols
+    base_currency = str(base_currency).strip().upper()
 
-    # Accumulate raw income and expenses
-    income_acc: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    expense_acc: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    # Keep arithmetic exact through aggregation; this adapter converts to
+    # Google Sheets' numeric representation only when preparing its output.
+    income_acc: dict[int, dict[int, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    expense_acc: dict[int, dict[int, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
 
     for row in rows[1:]:
-        if len(row) <= max(date_col, amount_col):
+        if len(row) <= max(date_col, amount_col, currency_col):
+            continue
+        if str(row[currency_col]).strip().upper() != base_currency:
             continue
         try:
             date_str = row[date_col].strip()
             year = int(date_str[:4])
             month = int(date_str[5:7])
             raw = row[amount_col].strip().replace(",", ".")
-            amount = float(raw)
+            amount = as_decimal(raw)
             if amount > 0:
                 income_acc[year][month] += amount
             else:
                 expense_acc[year][month] += abs(amount)
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, InvalidOperation):
             continue
 
     # Build combined result
@@ -73,9 +81,12 @@ def compute_monthly_data(
         result[year] = {}
         all_months = sorted(set(income_acc.get(year, {})) | set(expense_acc.get(year, {})))
         for month in all_months:
-            income = round(income_acc[year].get(month, 0.0), 2)
-            expenses = round(expense_acc[year].get(month, 0.0), 2)
-            net = round(income - expenses, 2)
+            income = float(quantize_money(income_acc[year].get(month, Decimal(0)), base_currency))
+            expenses = float(quantize_money(expense_acc[year].get(month, Decimal(0)), base_currency))
+            net = float(quantize_money(
+                income_acc[year].get(month, Decimal(0)) - expense_acc[year].get(month, Decimal(0)),
+                base_currency,
+            ))
             savings_rate = round(net / income * 100, 1) if income > 0 else 0.0
             result[year][month] = {
                 "income": income,
@@ -114,22 +125,22 @@ def compute_yoy_delta(
 
 # ── Sheet management ──────────────────────────────────────────────
 
-def refresh_trends(sheets_client: Any) -> None:
+def refresh_trends(sheets_client: Any, base_currency: str = "EUR") -> None:
     """Create or update the Trends tab with cash flow analysis and YoY deltas."""
     rows = sheets_client.get_all_rows()
     if len(rows) < 2:
         logger.info("Not enough data for trends yet")
         return
 
-    data = compute_monthly_data(rows)
+    currency = str(base_currency).strip().upper()
+    data = compute_monthly_data(rows, currency)
     if not data:
+        logger.info("No %s-denominated rows to build trends", currency)
         return
 
     years = sorted(data.keys())
     n_years = len(years)
     expense_deltas = compute_yoy_delta(data, "expenses")
-    savings_deltas = compute_yoy_delta(data, "savings_rate")
-
     # ── Get or create Trends tab ─────────────────────────────────
     try:
         ws = sheets_client._spreadsheet.worksheet(_TRENDS_SHEET)
@@ -189,7 +200,7 @@ def refresh_trends(sheets_client: Any) -> None:
     _format_trends_tab(sheets_client, ws.id, n_years, bool(expense_deltas))
 
     # ── Chart: Spending + Savings Rate ─────────────────────────────
-    _create_trends_chart(sheets_client, ws.id, years)
+    _create_trends_chart(sheets_client, ws.id, years, currency)
 
 
 def _format_trends_tab(
@@ -287,7 +298,7 @@ def _format_trends_tab(
 
 
 def _create_trends_chart(
-    sheets_client: Any, sheet_id: int, years: list[int]
+    sheets_client: Any, sheet_id: int, years: list[int], currency: str = "EUR"
 ) -> None:
     """Create two line charts: Expenses by year + Savings Rate by year."""
     if len(years) < 1:
@@ -331,7 +342,7 @@ def _create_trends_chart(
                                 "legendPosition": "BOTTOM_LEGEND",
                                 "axis": [
                                     {"position": "BOTTOM_AXIS", "title": "Month"},
-                                    {"position": "LEFT_AXIS", "title": "€"},
+                                    {"position": "LEFT_AXIS", "title": currency},
                                 ],
                                 "domains": [{"domain": {"sourceRange": {"sources": [{
                                     "sheetId": sheet_id,

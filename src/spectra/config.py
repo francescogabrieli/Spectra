@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Literal
@@ -88,7 +89,7 @@ class Settings(BaseSettings):
 
     # ── AI Provider ──────────────────────────────────────────────
     ai_provider: Literal["gemini", "openai", "local"] = Field(
-        default="gemini",
+        default="local",
         validation_alias=AliasChoices("AI_PROVIDER", "AI_PrOVIDER"),
     )
 
@@ -106,6 +107,21 @@ class Settings(BaseSettings):
     # ── Database ─────────────────────────────────────────────────
     db_path: Path = Field(default=_PROJECT_ROOT / "data" / "spectra.db")
 
+    # Internal service endpoints. Local defaults work for native multi-process
+    # runs; Docker Compose overrides them with service DNS names.
+    service_role: str = Field(default="gateway", validation_alias="SPECTRA_SERVICE_ROLE")
+    ledger_url: str = "http://127.0.0.1:8081"
+    import_service_url: str = "http://127.0.0.1:8082"
+    enrichment_url: str = "http://127.0.0.1:8083"
+    import_db_path: Path = Field(default=_PROJECT_ROOT / "data" / "imports.sqlite")
+    fx_db_path: Path = Field(default=_PROJECT_ROOT / "data" / "fx-rates.sqlite")
+    internal_api_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+
+    # Uploads are intentionally bounded because statements can contain sensitive
+    # data and parsing is performed in a worker thread.
+    max_upload_bytes: int = Field(default=25 * 1024 * 1024, gt=0, le=100 * 1024 * 1024)
+    max_backup_bytes: int = Field(default=512 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024)
+
     # ── Behaviour ────────────────────────────────────────────────
     log_level: str = "INFO"
 
@@ -113,7 +129,17 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _check_required_secrets(self) -> "Settings":
         """Warn (don't crash) about missing secrets."""
-        self.db_path = _prepare_db_path(self.db_path)
+        # Only the ledger owns/migrates the canonical financial database in a
+        # service deployment. Other processes never touch the ledger path.
+        if self.service_role == "ledger":
+            self.db_path = _prepare_db_path(self.db_path)
+        elif not self.db_path.is_absolute():
+            self.db_path = (_PROJECT_ROOT / self.db_path).resolve()
+
+        for field_name in ("import_db_path", "fx_db_path"):
+            path = getattr(self, field_name)
+            if not path.is_absolute():
+                setattr(self, field_name, (_PROJECT_ROOT / path).resolve())
 
         credentials_file = Path(self.google_sheets_credentials_file)
         if not credentials_file.is_absolute():
@@ -121,22 +147,13 @@ class Settings(BaseSettings):
             self.google_sheets_credentials_file = str(credentials_file)
 
         missing: list[str] = []
-
-        if not self.spreadsheet_id:
-            missing.append("SPREADSHEET_ID")
-
-        if not self.google_sheets_credentials_b64 and not credentials_file.exists():
-            missing.append(
-                "GOOGLE_SHEETS_CREDENTIALS_B64 or GOOGLE_SHEETS_CREDENTIALS_FILE"
-            )
-
         if self.ai_provider == "gemini" and not self.gemini_api_key:
             missing.append("GEMINI_API_KEY")
         elif self.ai_provider == "openai" and not self.openai_api_key:
             missing.append("OPENAI_API_KEY")
         # 'local' mode needs no API keys
 
-        if missing:
+        if missing and self.service_role == "enrichment":
             logger.warning(
                 "Missing secrets (some features may fail): %s", ", ".join(missing)
             )
@@ -144,9 +161,26 @@ class Settings(BaseSettings):
         return self
 
 
-def load_settings() -> Settings:
+def load_settings(
+    *, service_role: str | None = None, env_file: Path | str | None = None,
+) -> Settings:
     """Load settings and configure logging."""
-    settings = Settings()  # type: ignore[call-arg]
+    role = service_role or os.environ.get("SPECTRA_SERVICE_ROLE", "gateway")
+    overrides: dict[str, object] = {"service_role": role}
+    if role != "enrichment":
+        # Explicit empty init values prevent Pydantic from copying provider
+        # secrets out of .env or the process environment into unrelated apps.
+        overrides.update({"openai_api_key": "", "gemini_api_key": ""})
+    if role != "importer":
+        overrides.update({
+            "spreadsheet_id": "",
+            "google_sheets_credentials_b64": "",
+            "google_sheets_credentials_file": "credentials.json",
+        })
+    if env_file is None:
+        settings = Settings(**overrides)  # type: ignore[call-arg]
+    else:
+        settings = Settings(**overrides, _env_file=env_file)  # type: ignore[call-arg]
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -158,6 +192,6 @@ def load_settings() -> Settings:
         "Spectra config loaded (provider=%s, db=%s, env=%s)",
         settings.ai_provider,
         settings.db_path,
-        _ENV_FILE,
+        env_file or _ENV_FILE,
     )
     return settings

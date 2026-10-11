@@ -16,7 +16,7 @@ RUN uv sync --locked --no-dev
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
-RUN mkdir -p /app/data /app/inbox /app/processed
+RUN mkdir -p /app/data /app/staging /app/fx-cache
 
 EXPOSE 8080
 

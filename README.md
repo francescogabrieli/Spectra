@@ -30,6 +30,9 @@ Main capabilities:
 - Explore budgets, trends, recurring payments, and transaction history in a local web app
 - Optionally sync outputs to Google Sheets
 
+Currency handling, historical database migrations, backups, and offline behavior are described in
+[Data and currency safety](docs/data-and-currency-safety.md).
+
 ## Screenshots
 
 | Dashboard | Transactions |
@@ -52,10 +55,19 @@ Main capabilities:
 
 ## Quick Start
 
+Spectra runs as four independent local services behind one web gateway. Docker Compose starts
+the full set together. The native launcher also starts all four processes and shuts them down
+together. Only the gateway has a host-published port; the internal APIs stay on the Compose
+network or loopback.
+
 There are two ways to run Spectra:
 
 - `Docker`: best for most users
 - `Native Python`: better for development
+
+Spectra binds to `127.0.0.1` by default and uses local categorization. Docker Compose also binds
+to loopback by default. Set `SPECTRA_HOST=0.0.0.0` only when you intend to expose the service on
+your network; the web app has no authentication, so do not expose it to an untrusted network.
 
 ### Option 1: Run with Docker
 
@@ -258,36 +270,34 @@ To enable it:
 4. Download the JSON credentials file
 5. Share your target spreadsheet with the service account email
 6. Set `SPREADSHEET_ID`
-7. Set `GOOGLE_SHEETS_CREDENTIALS_FILE` or `GOOGLE_SHEETS_CREDENTIALS_B64`
+7. For native runs, set `GOOGLE_SHEETS_CREDENTIALS_FILE` or
+   `GOOGLE_SHEETS_CREDENTIALS_B64`. In Docker Compose, use `GOOGLE_SHEETS_CREDENTIALS_B64`;
+   credential files are excluded from the image build context.
 
 ## CLI Usage
 
-These commands are useful if you want to process files without the web UI:
+The CLI uses the same importer review/enrichment and ledger commit APIs as the web UI. Keep
+Spectra running in another terminal before using import commands:
 
 ```bash
-# Process a folder
+# Terminal 1: start gateway, importer, enrichment, and ledger together
+uv run spectra --serve
+
+# Terminal 2: preview without changing the financial ledger
+uv run spectra --file export.csv --dry-run
+
+# Commit locally through the ledger (optional Sheets sync follows)
+uv run spectra --file export.csv
+
+# Process a folder through the same services
 uv run python -m spectra --inbox inbox/
-
-# Preview without writing outputs
 uv run python -m spectra --inbox inbox/ --dry-run
-
-# Process a single file
-uv run python -m spectra --file export.csv
-
-# Run the dashboard on a custom port
-uv run python -m spectra --serve --port 3000
 ```
 
 ## Project Structure
 
-```text
-src/spectra/           Application code
-src/spectra/web/       FastAPI server, templates, static assets
-tests/                 Automated tests
-docs/                  Architecture, roadmap, repository notes
-scripts/launchers/     Launcher implementations
-tools/dev/             Developer utilities
-```
+The process entrypoints and API ownership are documented in
+[the service architecture](docs/architecture.md) and [the repository layout](docs/repository-layout.md).
 
 Runtime data is stored locally in folders such as:
 
@@ -295,9 +305,10 @@ Runtime data is stored locally in folders such as:
 - `inbox/`
 - `processed/`
 
-By default the local SQLite database lives at `data/spectra.db`.
-
-If you already have a legacy `data/prism.db`, Spectra migrates it automatically on startup. If both files exist, Spectra keeps using `data/spectra.db` and leaves the legacy file untouched.
+By default the canonical ledger lives at `data/spectra.db`. Only the ledger process opens or
+migrates it. Import review staging and exchange-rate cache each use a separate store; neither is
+mounted into the ledger container. A legacy `data/prism.db` is migrated only when the ledger
+starts. If both names exist, the ledger uses `data/spectra.db` and leaves `prism.db` untouched.
 
 ## Privacy
 

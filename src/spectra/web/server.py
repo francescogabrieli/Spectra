@@ -6,9 +6,9 @@ import logging
 import csv
 import io
 import re
-import shutil
-import tempfile
+import threading
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,9 @@ from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.background import BackgroundTask
 
 from spectra.ai import CategorisedTransaction
 from spectra.config import Settings, load_settings
@@ -34,9 +37,11 @@ from spectra.cycles import (
     parse_iso_date,
     serialize_cycle_rule,
 )
-from spectra.db import BookmarkDB
+from spectra.services.clients import (
+    EnrichmentClient, ImportClient, LedgerClient, ServiceResponseError, ServiceUnavailable,
+)
 from spectra.ml_classifier import build_seed_data
-from spectra.pipeline import _enrich_categorised_transactions, _load_existing_transfer_candidates
+from spectra.money import as_decimal, currency_exponent, decimal_text, quantize_money
 from spectra.recurring import detect_recurring_kind
 from spectra.review import (
     TRANSFER_STATUS_CONFIRMED,
@@ -44,8 +49,6 @@ from spectra.review import (
     TRANSFER_STATUS_NONE,
     TRANSFER_STATUS_SUGGESTED,
     apply_review_state,
-    build_import_batch_id,
-    match_internal_transfers,
 )
 from spectra.rules import VALID_RULE_TYPES, normalize_rule_type
 
@@ -76,8 +79,17 @@ _TRANSACTION_EXPORT_HEADERS = [
     "category",
     "amount",
     "currency",
+    "amount_decimal",
+    "amount_minor",
     "original_amount",
     "original_currency",
+    "original_amount_decimal",
+    "original_amount_minor",
+    "conversion_rate",
+    "conversion_date",
+    "conversion_source",
+    "conversion_error",
+    "currency_source",
     "original_description",
     "counterpart",
     "recurring",
@@ -86,36 +98,75 @@ _TRANSACTION_EXPORT_HEADERS = [
     "needs_review",
     "review_reason",
     "account_name",
+    "account_id",
     "import_batch_id",
     "transfer_group_id",
     "transfer_status",
     "excluded_from_spend",
 ]
+_UPLOAD_IMPORT_SLOTS = threading.BoundedSemaphore(2)
+
+
+@app.get("/health/live")
+async def health_live() -> dict[str, str]:
+    return {"service": "gateway", "status": "live"}
+
+
+@app.get("/health/ready")
+async def health_ready() -> dict[str, Any]:
+    """Readiness requires each API the gateway routes to be reachable."""
+    import httpx
+
+    settings = load_settings()
+    dependencies = {
+        "ledger": f"{settings.ledger_url.rstrip('/')}/health/ready",
+        "importer": f"{settings.import_service_url.rstrip('/')}/health/ready",
+        "enrichment": f"{settings.enrichment_url.rstrip('/')}/health/ready",
+    }
+    states: dict[str, str] = {}
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        for name, url in dependencies.items():
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                states[name] = "ready"
+            except httpx.HTTPError:
+                states[name] = "unavailable"
+    if any(state != "ready" for state in states.values()):
+        return JSONResponse(
+            {"service": "gateway", "status": "not_ready", "dependencies": states},
+            status_code=503,
+        )
+    return {"service": "gateway", "status": "ready", "dependencies": states}
 
 
 # ── Global error handler ─────────────────────────────────────────
 
 
-from fastapi.responses import JSONResponse as _JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
-
-
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request, exc):
-    return _JSONResponse({"error": str(exc.detail)}, status_code=exc.status_code)
+    return JSONResponse({"error": str(exc.detail)}, status_code=exc.status_code)
 
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request, exc):
     logger.exception("Unhandled error: %s", exc)
-    return _JSONResponse({"error": "Internal server error"}, status_code=500)
+    return JSONResponse({"error": "Internal server error"}, status_code=500)
 
-def _get_db() -> BookmarkDB:
+
+@app.exception_handler(ServiceUnavailable)
+async def service_unavailable_handler(request, exc: ServiceUnavailable):
+    return JSONResponse(
+        {"error": str(exc), "service_unavailable": True},
+        status_code=503,
+    )
+
+def _get_db() -> LedgerClient:
     settings = load_settings()
-    return BookmarkDB(settings.db_path)
+    return LedgerClient(settings)
 
 
-def _load_app_preferences(db: BookmarkDB | None = None) -> dict[str, Any]:
+def _load_app_preferences(db: LedgerClient | None = None) -> dict[str, Any]:
     owns_db = db is None
     db = db or _get_db()
     try:
@@ -166,21 +217,30 @@ def _build_cycle_payload(cycle_rule: str):
     }
 
 
-def _build_cycle_burn_rate(*, today, period_start, period_end, total_spent: float) -> dict[str, Any]:
+def _build_cycle_burn_rate(
+    *, today, period_start, period_end, total_spent: Decimal, currency: str,
+) -> dict[str, Any]:
     """Estimate end-of-cycle spend based on the current daily burn."""
     total_days = max((period_end - period_start).days, 1)
     elapsed_days = min(max((today - period_start).days + 1, 1), total_days)
     remaining_days = max(total_days - elapsed_days, 0)
-    daily_spend = total_spent / elapsed_days
+    total_spent = as_decimal(total_spent)
+    daily_spend = total_spent / Decimal(elapsed_days)
     projected_total = daily_spend * total_days
+    spent_exact = quantize_money(total_spent, currency)
+    daily_exact = quantize_money(daily_spend, currency)
+    projected_exact = quantize_money(projected_total, currency)
 
     return {
         "elapsed_days": elapsed_days,
         "total_days": total_days,
         "remaining_days": remaining_days,
-        "spent_so_far": round(total_spent, 2),
-        "daily_spend": round(daily_spend, 2),
-        "projected_total": round(projected_total, 2),
+        "spent_so_far": float(spent_exact),
+        "spent_so_far_decimal": decimal_text(spent_exact, currency),
+        "daily_spend": float(daily_exact),
+        "daily_spend_decimal": decimal_text(daily_exact, currency),
+        "projected_total": float(projected_exact),
+        "projected_total_decimal": decimal_text(projected_exact, currency),
     }
 
 
@@ -193,7 +253,7 @@ def _normalize_currency_code(value: str | None) -> str | None:
     return code
 
 
-def _resolve_base_currency(settings: Settings, db: BookmarkDB) -> str:
+def _resolve_base_currency(settings: Settings, db: LedgerClient) -> str:
     stored = _normalize_currency_code(db.get_app_setting(_BASE_CURRENCY_SETTING_KEY))
     if stored:
         return stored
@@ -204,16 +264,19 @@ def _resolve_base_currency(settings: Settings, db: BookmarkDB) -> str:
 def _provider_is_ready(settings: Settings) -> bool:
     if settings.ai_provider == "local":
         return True
-    if settings.ai_provider == "openai":
-        return bool(settings.openai_api_key)
-    return bool(settings.gemini_api_key)
+    try:
+        with EnrichmentClient(settings) as enrichment:
+            status = enrichment.provider_status()
+    except ServiceUnavailable:
+        return False
+    return bool(status.get("ready"))
 
 
-def _build_setup_status(settings: Settings, db: BookmarkDB) -> dict[str, Any]:
+def _build_setup_status(settings: Settings, db: LedgerClient) -> dict[str, Any]:
     stored_base_currency = _normalize_currency_code(db.get_app_setting(_BASE_CURRENCY_SETTING_KEY))
     effective_currency = _resolve_base_currency(settings, db)
-    tx_count_row = db._conn.execute("SELECT COUNT(*) FROM tx_history").fetchone()
-    tx_count = int(tx_count_row[0] if tx_count_row else 0)
+    ledger_summary = db.read_model("setup_summary")
+    tx_count = int(ledger_summary["transaction_count"])
     has_existing_transactions = tx_count > 0
     requires_base_currency_setup = stored_base_currency is None and not has_existing_transactions
     google_sheets_configured = bool(settings.spreadsheet_id)
@@ -300,7 +363,7 @@ def _build_setup_status(settings: Settings, db: BookmarkDB) -> dict[str, Any]:
     }
 
 
-def _requires_base_currency_setup(db: BookmarkDB) -> bool:
+def _requires_base_currency_setup(db: LedgerClient) -> bool:
     settings = load_settings()
     return bool(_build_setup_status(settings, db)["requires_base_currency_setup"])
 
@@ -321,7 +384,7 @@ def _setup_redirect_if_needed(request: Request) -> RedirectResponse | None:
     if request.url.path == "/settings":
         return None
     settings = load_settings()
-    with BookmarkDB(settings.db_path) as db:
+    with LedgerClient(settings) as db:
         if _build_setup_status(settings, db)["requires_base_currency_setup"]:
             return RedirectResponse(url=_SETUP_SETTINGS_URL, status_code=303)
     return None
@@ -367,8 +430,17 @@ def _transactions_to_csv(rows: list[dict[str, Any]]) -> str:
             _csv_safe_value(row.get("category")),
             _csv_safe_value(row.get("amount")),
             _csv_safe_value(row.get("currency")),
+            _csv_safe_value(row.get("amount_decimal")),
+            _csv_safe_value(row.get("amount_minor")),
             _csv_safe_value(row.get("original_amount")),
             _csv_safe_value(row.get("original_currency")),
+            _csv_safe_value(row.get("original_amount_decimal")),
+            _csv_safe_value(row.get("original_amount_minor")),
+            _csv_safe_value(row.get("conversion_rate")),
+            _csv_safe_value(row.get("conversion_date")),
+            _csv_safe_value(row.get("conversion_source")),
+            _csv_safe_value(row.get("conversion_error")),
+            _csv_safe_value(row.get("currency_source")),
             _csv_safe_value(row.get("original_description")),
             _csv_safe_value(row.get("counterpart")),
             _csv_safe_value(row.get("recurring")),
@@ -377,6 +449,7 @@ def _transactions_to_csv(rows: list[dict[str, Any]]) -> str:
             _csv_safe_value(int(bool(row.get("needs_review")))),
             _csv_safe_value(row.get("review_reason")),
             _csv_safe_value(row.get("account_name")),
+            _csv_safe_value(row.get("account_id")),
             _csv_safe_value(row.get("import_batch_id")),
             _csv_safe_value(row.get("transfer_group_id")),
             _csv_safe_value(row.get("transfer_status")),
@@ -386,7 +459,7 @@ def _transactions_to_csv(rows: list[dict[str, Any]]) -> str:
 
 
 def _persist_learning(
-    db: BookmarkDB,
+    db: LedgerClient,
     *,
     tx_id: str | None,
     original_description: str,
@@ -427,7 +500,7 @@ def _normalize_transfer_category(amount: float) -> str:
     return "Transfer In" if float(amount) > 0 else "Transfer"
 
 
-def _refresh_review_state(db: BookmarkDB, tx_id: str) -> dict[str, Any] | None:
+def _refresh_review_state(db: LedgerClient, tx_id: str) -> dict[str, Any] | None:
     tx = db.get_transaction(tx_id)
     if not tx:
         return None
@@ -448,6 +521,7 @@ def _serialize_transaction_model(tx: CategorisedTransaction, *, include_preview_
         "category": tx.category,
         "amount": tx.amount,
         "currency": tx.currency,
+        "amount_decimal": tx.amount_decimal,
         "recurring": tx.recurring,
         "original_description": tx.original_description,
         "counterpart": tx.counterpart,
@@ -456,12 +530,21 @@ def _serialize_transaction_model(tx: CategorisedTransaction, *, include_preview_
         "needs_review": tx.needs_review,
         "review_reason": tx.review_reason,
         "account_name": tx.account_name,
+        "account_id": tx.account_id,
+        "account_balance": tx.account_balance,
+        "account_balance_date": tx.account_balance_date,
+        "currency_source": tx.currency_source,
         "import_batch_id": tx.import_batch_id,
         "transfer_group_id": tx.transfer_group_id,
         "transfer_status": tx.transfer_status,
         "excluded_from_spend": tx.excluded_from_spend,
         "original_amount": tx.original_amount,
         "original_currency": tx.original_currency,
+        "original_amount_decimal": tx.original_amount_decimal,
+        "conversion_rate": tx.conversion_rate,
+        "conversion_date": tx.conversion_date,
+        "conversion_source": tx.conversion_source,
+        "conversion_error": tx.conversion_error,
     }
     if getattr(tx, "category_suggestions", None):
         row["category_suggestions"] = [
@@ -485,6 +568,12 @@ def _payload_to_transaction(payload: dict[str, Any], *, base_currency: str) -> C
         currency=str(payload.get("currency", base_currency) or base_currency),
         original_amount=payload.get("original_amount"),
         original_currency=payload.get("original_currency"),
+        original_amount_decimal=payload.get("original_amount_decimal"),
+        conversion_rate=payload.get("conversion_rate"),
+        conversion_date=payload.get("conversion_date"),
+        conversion_source=str(payload.get("conversion_source", "") or ""),
+        conversion_error=str(payload.get("conversion_error", "") or ""),
+        amount_decimal=payload.get("amount_decimal"),
         date=str(payload.get("date", "") or ""),
         statement_category=str(payload.get("statement_category", "") or ""),
         recurring=str(payload.get("recurring", "") or ""),
@@ -494,6 +583,10 @@ def _payload_to_transaction(payload: dict[str, Any], *, base_currency: str) -> C
         needs_review=bool(payload.get("needs_review", False)),
         review_reason=str(payload.get("review_reason", "") or ""),
         account_name=str(payload.get("account_name", "") or ""),
+        account_id=str(payload.get("account_id", "") or ""),
+        account_balance=payload.get("account_balance"),
+        account_balance_date=str(payload.get("account_balance_date", "") or ""),
+        currency_source=str(payload.get("currency_source", "parser") or "parser"),
         import_batch_id=str(payload.get("import_batch_id", "") or ""),
         transfer_group_id=str(payload.get("transfer_group_id", "") or ""),
         transfer_status=str(payload.get("transfer_status", TRANSFER_STATUS_NONE) or TRANSFER_STATUS_NONE),
@@ -502,7 +595,7 @@ def _payload_to_transaction(payload: dict[str, Any], *, base_currency: str) -> C
 
 
 def _simulate_rule_impact(
-    db: BookmarkDB,
+    db: LedgerClient,
     *,
     rule_type: str,
     pattern: str,
@@ -515,13 +608,7 @@ def _simulate_rule_impact(
         "pattern": pattern,
         "is_active": True,
     }
-    rows = db._conn.execute(
-        """
-        SELECT tx_id, date, clean_name, original_description, category
-        FROM tx_history
-        ORDER BY date DESC, tx_id DESC
-        """
-    ).fetchall()
+    rows = db.read_model("rule_impact_rows")
 
     examples: list[dict[str, Any]] = []
     impact_count = 0
@@ -563,28 +650,34 @@ def _simulate_rule_impact(
 def _build_summary_insights(
     *,
     scope: str,
-    rows: list[tuple[str, str, float, str]],
+    rows: list[tuple[str, str, Decimal, str]],
     period_start,
     period_end,
     cycle_rule: str,
-    total_spent: float,
+    total_spent: Decimal,
     uncategorized: int,
     burn_rate: dict[str, Any] | None,
-    budget_limits: dict[str, float],
+    budget_limits: dict[str, Decimal],
+    currency: str = "EUR",
 ) -> list[dict[str, str]]:
     from collections import defaultdict
     from datetime import timedelta
     from statistics import median
 
-    def fmt(amount: float) -> str:
-        return f"EUR {amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    def fmt(amount: Decimal) -> str:
+        amount = quantize_money(amount, currency)
+        return f"{currency} {amount:,.{currency_exponent(currency)}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
     insights: list[dict[str, str]] = []
 
     if scope == "cycle" and burn_rate:
-        total_budget = round(sum(limit for limit in budget_limits.values() if limit and limit > 0), 2)
+        total_budget = sum(
+            (limit for limit in budget_limits.values() if limit and limit > 0), Decimal(0),
+        )
         if total_budget > 0:
-            projected_total = float(burn_rate.get("projected_total", 0.0))
+            projected_total = as_decimal(
+                burn_rate.get("projected_total_decimal", burn_rate.get("projected_total", 0))
+            )
             if projected_total > total_budget:
                 insights.append(
                     {
@@ -620,11 +713,11 @@ def _build_summary_insights(
     if scope != "cycle":
         return insights[:4]
 
-    current_by_category: dict[str, float] = defaultdict(float)
-    previous_by_category: dict[str, float] = defaultdict(float)
-    history_by_merchant: dict[str, list[float]] = defaultdict(list)
-    current_expenses: list[tuple[str, float, str]] = []
-    subscription_by_merchant: dict[str, list[tuple[object, float]]] = defaultdict(list)
+    current_by_category: dict[str, Decimal] = defaultdict(Decimal)
+    previous_by_category: dict[str, Decimal] = defaultdict(Decimal)
+    history_by_merchant: dict[str, list[Decimal]] = defaultdict(list)
+    current_expenses: list[tuple[str, Decimal, str]] = []
+    subscription_by_merchant: dict[str, list[tuple[object, Decimal]]] = defaultdict(list)
 
     previous_cycle_start = cycle_start_for(period_start - timedelta(days=1), cycle_rule)
     previous_cycle_end = period_start
@@ -634,7 +727,7 @@ def _build_summary_insights(
         if amount >= 0:
             continue
 
-        spend = abs(float(amount))
+        spend = abs(as_decimal(amount))
         merchant = str(clean_name)
         category_name = str(category)
 
@@ -651,16 +744,16 @@ def _build_summary_insights(
 
     biggest_delta = None
     for category_name, current_total in current_by_category.items():
-        previous_total = previous_by_category.get(category_name, 0.0)
+        previous_total = previous_by_category.get(category_name, Decimal(0))
         delta = current_total - previous_total
-        if delta <= max(25.0, previous_total * 0.25):
+        if delta <= max(Decimal(25), previous_total * Decimal("0.25")):
             continue
         if biggest_delta is None or delta > biggest_delta[1]:
             biggest_delta = (category_name, delta, previous_total, current_total)
 
     if biggest_delta:
         category_name, delta, previous_total, current_total = biggest_delta
-        previous_text = fmt(previous_total) if previous_total else "EUR 0,00"
+        previous_text = fmt(previous_total) if previous_total else fmt(0)
         insights.append(
             {
                 "type": "category_delta",
@@ -671,13 +764,13 @@ def _build_summary_insights(
             }
         )
 
-    anomalies: list[tuple[str, float, float]] = []
-    first_time_large: list[tuple[str, float]] = []
+    anomalies: list[tuple[str, Decimal, Decimal]] = []
+    first_time_large: list[tuple[str, Decimal]] = []
     for merchant, spend, _category_name in current_expenses:
         past_amounts = history_by_merchant.get(merchant, [])
         if len(past_amounts) >= 2:
-            baseline = float(median(past_amounts))
-            if baseline > 0 and spend > baseline * 1.8 and (spend - baseline) >= 20:
+            baseline = median(past_amounts)
+            if baseline > 0 and spend > baseline * Decimal("1.8") and (spend - baseline) >= 20:
                 anomalies.append((merchant, spend, baseline))
         elif not past_amounts and spend >= 150:
             first_time_large.append((merchant, spend))
@@ -707,7 +800,7 @@ def _build_summary_insights(
             }
         )
 
-    subscription_changes: list[tuple[str, float, float]] = []
+    subscription_changes: list[tuple[str, Decimal, Decimal]] = []
     for merchant, history in subscription_by_merchant.items():
         history.sort(key=lambda item: item[0])
         if len(history) < 2:
@@ -717,9 +810,9 @@ def _build_summary_insights(
             continue
 
         previous_amounts = [amount for _dt, amount in history[:-1]]
-        baseline = float(median(previous_amounts)) if previous_amounts else 0.0
+        baseline = median(previous_amounts) if previous_amounts else Decimal(0)
         diff = latest_amount - baseline
-        if baseline > 0 and abs(diff) >= max(1.0, baseline * 0.08):
+        if baseline > 0 and abs(diff) >= max(Decimal(1), baseline * Decimal("0.08")):
             subscription_changes.append((merchant, latest_amount, baseline))
 
     if subscription_changes:
@@ -743,40 +836,40 @@ def _build_summary_insights(
 
 
 @app.get("/", response_class=HTMLResponse)
-async def page_dashboard(request: Request):
+def page_dashboard(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "dashboard.html", _template_context(request))
 
 
 @app.get("/transactions", response_class=HTMLResponse)
-async def page_transactions(request: Request):
+def page_transactions(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "transactions.html", _template_context(request))
 
 
 @app.get("/upload", response_class=HTMLResponse)
-async def page_upload(request: Request):
+def page_upload(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "upload.html", _template_context(request))
 
 
 @app.get("/settings", response_class=HTMLResponse)
-async def page_settings(request: Request):
+def page_settings(request: Request):
     return templates.TemplateResponse(request, "settings.html", _template_context(request))
 
 
 @app.get("/review", response_class=HTMLResponse)
-async def page_review(request: Request):
+def page_review(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "review.html", _template_context(request))
 
 
 @app.get("/subscriptions", response_class=HTMLResponse)
-async def page_subscriptions(request: Request):
+def page_subscriptions(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "subscriptions.html", _template_context(request))
@@ -786,7 +879,7 @@ async def page_subscriptions(request: Request):
 
 
 @app.get("/api/summary")
-async def api_summary(scope: str = Query("cycle")):
+def api_summary(scope: str = Query("cycle")):
     """Return dashboard-level stats."""
     scope = (scope or "cycle").strip().lower()
     if scope not in _VALID_SUMMARY_SCOPES:
@@ -813,39 +906,43 @@ async def api_summary(scope: str = Query("cycle")):
         period_end = today + timedelta(days=1)
         scope_label = f"Year to date ({format_cycle_label(period_start, period_end)})"
 
-    burn_rate = (
-        _build_cycle_burn_rate(
-            today=today,
-            period_start=period_start,
-            period_end=period_end,
-            total_spent=0.0,
-        )
-        if scope == "cycle"
-        else None
-    )
+    burn_rate = None
 
     with _get_db() as db:
-        rows = db._conn.execute(
-            """
-            SELECT date, clean_name, amount, category
-            FROM tx_history
-            WHERE excluded_from_spend = 0
-            ORDER BY date DESC
-            """
-        ).fetchall()
-        budget_limits = db.get_budget_limits()
+        base_currency = _resolve_base_currency(load_settings(), db)
+        rows = db.read_model("summary_rows", currency=base_currency)
+        non_base_currency_count = int(db.read_model(
+            "summary_non_base_count", start=period_start.isoformat(),
+            end=period_end.isoformat(), currency=base_currency,
+        ))
+        budget_limits = db.get_budget_limits_exact(base_currency)
         needs_review_count = db.count_review_queue()
         confirmed_internal_transfers_count = db.count_confirmed_transfer_groups()
 
+    rows = [
+        (tx_date, merchant, as_decimal(amount), category)
+        for tx_date, merchant, amount, category in rows
+    ]
+
     if not rows:
+        if scope == "cycle":
+            burn_rate = _build_cycle_burn_rate(
+                today=today,
+                period_start=period_start,
+                period_end=period_end,
+                total_spent=Decimal(0),
+                currency=base_currency,
+            )
         return {
             "total_spent": 0, "total_income": 0, "subscriptions": 0,
             "uncategorized": 0, "uncategorized_total": 0, "by_category": {}, "monthly": {},
             "monthly_ranges": {}, "top_merchants": [], "current_cycle": _build_cycle_payload(cycle_rule),
             "scope": scope, "scope_label": scope_label,
+            "base_currency": base_currency,
+            "non_base_currency_count": non_base_currency_count,
             "selected_period": {"start": period_start.isoformat(), "end": period_end.isoformat(), "label": scope_label},
             **preferences,
-            "has_data": False,
+            "has_data": non_base_currency_count > 0,
             "burn_rate": burn_rate,
             "insights": [],
             "needs_review_count": needs_review_count,
@@ -854,13 +951,13 @@ async def api_summary(scope: str = Query("cycle")):
 
     from collections import Counter, defaultdict
 
-    total_spent = 0.0
-    total_income = 0.0
-    subscriptions = 0.0
+    total_spent = Decimal(0)
+    total_income = Decimal(0)
+    subscriptions = Decimal(0)
     uncategorized = 0
     uncategorized_total = sum(1 for _d, _m, _a, cat in rows if str(cat) == "Uncategorized")
-    by_category: dict[str, float] = defaultdict(float)
-    monthly: dict[str, float] = defaultdict(float)
+    by_category: dict[str, Decimal] = defaultdict(Decimal)
+    monthly: dict[str, Decimal] = defaultdict(Decimal)
     monthly_ranges: dict[str, dict[str, str]] = {}
     merchant_totals: Counter = Counter()
     in_scope_count = 0
@@ -877,10 +974,12 @@ async def api_summary(scope: str = Query("cycle")):
                 bucket_end = bucket_start.replace(month=bucket_start.month + 1)
         return bucket_start, bucket_end
 
-    for tx_date_str, clean_name, amount, cat in rows:
+    for tx_date_str, clean_name, amount_text, cat in rows:
         tx_date = parse_iso_date(tx_date_str)
         if not (period_start <= tx_date < period_end):
             continue
+
+        amount = as_decimal(amount_text)
 
         in_scope_count += 1
 
@@ -903,11 +1002,14 @@ async def api_summary(scope: str = Query("cycle")):
 
     # Last 6 months
     sorted_months = sorted(monthly.keys())[-6:]
-    monthly_data = {m: round(monthly[m], 2) for m in sorted_months}
+    monthly_data = {m: float(quantize_money(monthly[m], base_currency)) for m in sorted_months}
     monthly_ranges_data = {m: monthly_ranges[m] for m in sorted_months}
 
     # Top 5
-    top5 = [{"name": n, "total": round(t, 2)} for n, t in merchant_totals.most_common(5)]
+    top5 = [
+        {"name": n, "total": float(quantize_money(t, base_currency))}
+        for n, t in merchant_totals.most_common(5)
+    ]
 
     if scope == "cycle":
         burn_rate = _build_cycle_burn_rate(
@@ -915,6 +1017,7 @@ async def api_summary(scope: str = Query("cycle")):
             period_start=period_start,
             period_end=period_end,
             total_spent=total_spent,
+            currency=base_currency,
         )
 
     insights = _build_summary_insights(
@@ -923,32 +1026,38 @@ async def api_summary(scope: str = Query("cycle")):
         period_start=period_start,
         period_end=period_end,
         cycle_rule=cycle_rule,
-        total_spent=total_spent,
+        total_spent=quantize_money(total_spent, base_currency),
         uncategorized=uncategorized,
         burn_rate=burn_rate,
         budget_limits=budget_limits,
+        currency=base_currency,
     )
 
     return {
-        "total_spent": round(total_spent, 2),
-        "total_income": round(total_income, 2),
-        "subscriptions": round(subscriptions, 2),
+        "total_spent": float(quantize_money(total_spent, base_currency)),
+        "total_income": float(quantize_money(total_income, base_currency)),
+        "subscriptions": float(quantize_money(subscriptions, base_currency)),
         "uncategorized": uncategorized,
         "uncategorized_total": uncategorized_total,
-        "by_category": {k: round(v, 2) for k, v in sorted(by_category.items(), key=lambda x: -x[1])},
+        "by_category": {
+            k: float(quantize_money(v, base_currency))
+            for k, v in sorted(by_category.items(), key=lambda x: -x[1])
+        },
         "monthly": monthly_data,
         "monthly_ranges": monthly_ranges_data,
         "top_merchants": top5,
         "current_cycle": _build_cycle_payload(cycle_rule),
         "scope": scope,
         "scope_label": scope_label,
+        "base_currency": base_currency,
+        "non_base_currency_count": non_base_currency_count,
         "selected_period": {
             "start": period_start.isoformat(),
             "end": period_end.isoformat(),
             "label": scope_label,
         },
         **preferences,
-        "has_data": in_scope_count > 0,
+        "has_data": in_scope_count > 0 or non_base_currency_count > 0,
         "burn_rate": burn_rate,
         "insights": insights,
         "needs_review_count": needs_review_count,
@@ -960,7 +1069,7 @@ async def api_summary(scope: str = Query("cycle")):
 
 
 @app.get("/api/transactions")
-async def api_transactions(
+def api_transactions(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=10, le=200),
     category: str = Query("", alias="category"),
@@ -993,7 +1102,7 @@ async def api_transactions(
 
 
 @app.get("/api/exports/transactions")
-async def api_export_transactions(
+def api_export_transactions(
     category: str = Query("", alias="category"),
     uncategorized_only: bool = Query(False),
     search: str = Query(""),
@@ -1030,9 +1139,8 @@ async def api_export_transactions(
 
 
 @app.patch("/api/transactions/{tx_id}")
-async def api_update_transaction(tx_id: str, request: Request):
+def api_update_transaction(tx_id: str, body: dict[str, Any]):
     """Update merchant name and/or category for a transaction."""
-    body = await request.json()
     new_category = body.get("category")
     new_merchant = body.get("merchant")
     apply_to_future = _coerce_bool(body.get("apply_to_future"), True)
@@ -1067,9 +1175,8 @@ async def api_update_transaction(tx_id: str, request: Request):
 
 
 @app.post("/api/transactions/bulk-category")
-async def api_bulk_update_category(request: Request):
+def api_bulk_update_category(body: dict[str, Any]):
     """Apply one category to multiple transactions quickly."""
-    body = await request.json()
     ids = body.get("ids") or []
     category = str(body.get("category") or "").strip()
     apply_to_future = _coerce_bool(body.get("apply_to_future"), True)
@@ -1084,11 +1191,7 @@ async def api_bulk_update_category(request: Request):
         return JSONResponse({"error": "ids must contain valid transaction IDs"}, status_code=400)
 
     with _get_db() as db:
-        placeholders = ",".join("?" for _ in cleaned_ids)
-        merchant_rows = db._conn.execute(
-            f"SELECT tx_id, clean_name, original_description FROM tx_history WHERE tx_id IN ({placeholders})",
-            cleaned_ids,
-        ).fetchall()
+        merchant_rows = db.read_model("transaction_merchants", ids=cleaned_ids)
         db.update_transactions(cleaned_ids, category=category)
 
         for tx_row_id, merchant_name, original_description in merchant_rows:
@@ -1107,7 +1210,7 @@ async def api_bulk_update_category(request: Request):
 
 
 @app.get("/api/review")
-async def api_review(
+def api_review(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=10, le=200),
     reason: str = Query(""),
@@ -1126,7 +1229,7 @@ async def api_review(
 
 
 @app.get("/api/exports/review")
-async def api_export_review(
+def api_export_review(
     reason: str = Query(""),
     transfer_status: str = Query(""),
     import_batch_id: str = Query(""),
@@ -1149,9 +1252,8 @@ async def api_export_review(
 
 
 @app.patch("/api/review/{tx_id}")
-async def api_review_transaction(tx_id: str, request: Request):
+def api_review_transaction(tx_id: str, body: dict[str, Any]):
     """Resolve or update a review-queue item."""
-    body = await request.json()
     new_category = body.get("category")
     new_merchant = body.get("merchant")
     apply_to_future = _coerce_bool(body.get("apply_to_future"), False)
@@ -1192,9 +1294,8 @@ async def api_review_transaction(tx_id: str, request: Request):
 
 
 @app.post("/api/transfers/confirm")
-async def api_confirm_transfer_group(request: Request):
+def api_confirm_transfer_group(body: dict[str, Any]):
     """Confirm or dismiss a suggested transfer pair."""
-    body = await request.json()
     transfer_group_id = str(body.get("transfer_group_id") or "").strip()
     action = str(body.get("action") or "").strip().lower()
 
@@ -1237,23 +1338,25 @@ async def api_confirm_transfer_group(request: Request):
 
 
 @app.get("/api/categories")
-async def api_categories():
+def api_categories():
     """Return all known categories."""
     with _get_db() as db:
-        cats = db._conn.execute(
-            "SELECT DISTINCT category FROM tx_history WHERE category != 'Uncategorized' ORDER BY category"
-        ).fetchall()
-    return {"categories": [row[0] for row in cats]}
+        categories = db.list_known_categories()
+    return {"categories": categories}
+
+
+@app.get("/api/accounts")
+def api_accounts():
+    """Return accounts and their latest explicitly imported balances."""
+    with _get_db() as db:
+        return {"accounts": db.list_accounts()}
 
 
 @app.get("/api/categories/options")
-async def api_categories_options():
+def api_categories_options():
     """Return all categories."""
     with _get_db() as db:
-        cats = db._conn.execute(
-            "SELECT DISTINCT category FROM tx_history WHERE category != 'Uncategorized' ORDER BY category"
-        ).fetchall()
-    known_cats = [row[0] for row in cats]
+        known_cats = db.list_known_categories()
     other_cats = [row[1] for row in build_seed_data()]
     return {"categories": sorted(set(known_cats + other_cats))}
 
@@ -1261,25 +1364,24 @@ async def api_categories_options():
 
 
 @app.get("/api/settings")
-async def api_settings():
+def api_settings():
     """Return current config for the settings page."""
     settings = load_settings()
     with _get_db() as db:
         preferences = _load_app_preferences(db)
         effective_currency = _resolve_base_currency(settings, db)
         setup_status = _build_setup_status(settings, db)
-        tx_count = db._conn.execute("SELECT COUNT(*) FROM tx_history").fetchone()[0]
-        merchant_count = db._conn.execute("SELECT COUNT(*) FROM merchant_categories").fetchone()[0]
-        feedback_count = db._conn.execute("SELECT COUNT(*) FROM learning_feedback").fetchone()[0]
-        active_rule_count = db._conn.execute(
-            "SELECT COUNT(*) FROM category_rules WHERE is_active = 1"
-        ).fetchone()[0]
-        cats = db._conn.execute(
-            "SELECT DISTINCT category FROM tx_history WHERE category != 'Uncategorized'"
-        ).fetchall()
+        ledger_summary = db.read_model("setup_summary")
+        tx_count = ledger_summary["transaction_count"]
+        legacy_currency_count = ledger_summary["legacy_currency_count"]
+        merchant_count = ledger_summary["merchant_count"]
+        feedback_count = ledger_summary["feedback_count"]
+        active_rule_count = ledger_summary["active_rule_count"]
+        cats = ledger_summary["categories"]
     return {
         "currency": effective_currency,
         "tx_count": tx_count,
+        "legacy_currency_count": legacy_currency_count,
         "merchant_count": merchant_count,
         "feedback_count": feedback_count,
         "active_rule_count": active_rule_count,
@@ -1292,10 +1394,38 @@ async def api_settings():
     }
 
 
+@app.get("/api/settings/legacy-currency")
+def api_legacy_currency_review(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+):
+    """List old transactions whose denomination needs explicit confirmation."""
+    with _get_db() as db:
+        return db.list_legacy_unknown_currency(page=page, per_page=per_page)
+
+
+@app.patch("/api/settings/legacy-currency")
+def api_confirm_legacy_currency(body: dict[str, Any]):
+    """Record user-confirmed currencies for legacy rows without changing amounts."""
+    items = body.get("items")
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        return JSONResponse({"error": "items must be a list of {id, currency} values"}, status_code=400)
+
+    def persist() -> int:
+        settings = load_settings()
+        with LedgerClient(settings) as db:
+            return db.confirm_legacy_currencies(items)
+
+    try:
+        confirmed = persist()
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return {"ok": True, "confirmed": confirmed}
+
+
 @app.patch("/api/settings/preferences")
-async def api_update_preferences(request: Request):
+def api_update_preferences(body: dict[str, Any]):
     """Save dashboard-local preferences such as theme and cycle start day."""
-    body = await request.json()
     updates: dict[str, str] = {}
 
     if "theme_preference" in body:
@@ -1366,7 +1496,7 @@ async def api_update_preferences(request: Request):
 
 
 @app.get("/api/settings/rules")
-async def api_get_category_rules():
+def api_get_category_rules():
     """Return user-defined categorization rules."""
     with _get_db() as db:
         rules = db.get_category_rules()
@@ -1382,9 +1512,8 @@ async def api_get_category_rules():
 
 
 @app.post("/api/settings/rules")
-async def api_create_category_rule(request: Request):
+def api_create_category_rule(body: dict[str, Any]):
     """Create a categorization rule (contains/regex => category)."""
-    body = await request.json()
     pattern = str(body.get("pattern") or "").strip()
     category = str(body.get("category") or "").strip()
     raw_rule_type = str(body.get("rule_type") or "contains")
@@ -1414,9 +1543,8 @@ async def api_create_category_rule(request: Request):
 
 
 @app.patch("/api/settings/rules/{rule_id}")
-async def api_update_category_rule(rule_id: int, request: Request):
+def api_update_category_rule(rule_id: int, body: dict[str, Any]):
     """Toggle or reorder a categorization rule."""
-    body = await request.json()
     move = str(body.get("move") or "").strip().lower()
     is_active = body.get("is_active") if "is_active" in body else None
 
@@ -1441,9 +1569,8 @@ async def api_update_category_rule(rule_id: int, request: Request):
 
 
 @app.post("/api/settings/rules/test")
-async def api_test_category_rule(request: Request):
+def api_test_category_rule(body: dict[str, Any]):
     """Preview whether a rule would match sample text and historical rows."""
-    body = await request.json()
     pattern = str(body.get("pattern") or "").strip()
     sample_text = str(body.get("sample_text") or "").strip()
 
@@ -1475,7 +1602,7 @@ async def api_test_category_rule(request: Request):
 
 
 @app.delete("/api/settings/rules/{rule_id}")
-async def api_delete_category_rule(rule_id: int):
+def api_delete_category_rule(rule_id: int):
     """Delete a categorization rule by ID."""
     with _get_db() as db:
         deleted = db.delete_category_rule(rule_id)
@@ -1485,32 +1612,25 @@ async def api_delete_category_rule(rule_id: int):
 
 
 @app.get("/api/settings/learning")
-async def api_learning_summary():
+def api_learning_summary():
     """Return recent learning events and summary counters."""
     with _get_db() as db:
         events = db.get_recent_learning_feedback(limit=40)
-        feedback_count = db._conn.execute("SELECT COUNT(*) FROM learning_feedback").fetchone()[0]
-        override_count = db._conn.execute("SELECT COUNT(*) FROM user_overrides").fetchone()[0]
-        uncategorized_count = db._conn.execute(
-            "SELECT COUNT(*) FROM tx_history WHERE category = 'Uncategorized'"
-        ).fetchone()[0]
-        learned_future_count = db._conn.execute(
-            "SELECT COUNT(*) FROM learning_feedback WHERE apply_to_future = 1"
-        ).fetchone()[0]
+        summary = db.read_model("learning_summary")
 
     return {
         "events": events,
         "summary": {
-            "feedback_count": int(feedback_count),
-            "override_count": int(override_count),
-            "uncategorized_count": int(uncategorized_count),
-            "learned_future_count": int(learned_future_count),
+            "feedback_count": summary["feedback_count"],
+            "override_count": summary["override_count"],
+            "uncategorized_count": summary["uncategorized_count"],
+            "learned_future_count": summary["learned_future_count"],
         },
     }
 
 
 @app.post("/api/settings/learning/reapply")
-async def api_reapply_learning():
+def api_reapply_learning():
     """Re-run deterministic learning on historical transactions."""
     with _get_db() as db:
         result = db.reapply_learning_to_history()
@@ -1518,9 +1638,8 @@ async def api_reapply_learning():
 
 
 @app.post("/api/settings/reset-db")
-async def api_reset_db(request: Request):
+def api_reset_db(body: dict[str, Any]):
     """Reset local SQLite data after explicit confirmation."""
-    body = await request.json()
     if body.get("confirm") != "RESET":
         return JSONResponse(
             {"ok": False, "error": "Confirmation token missing"},
@@ -1543,350 +1662,125 @@ async def api_reset_db(request: Request):
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
-    """Upload a supported file, parse & categorise, stream progress via SSE."""
-    supported_file_types = [".csv", ".pdf", ".ofx"]
+    """Validate the upload, then stream events from the independent importer."""
     import json as _json
     from fastapi.responses import StreamingResponse as _SR
 
     settings = load_settings()
-    with BookmarkDB(settings.db_path) as db:
-        if _build_setup_status(settings, db)["requires_base_currency_setup"]:
-            return _base_currency_setup_response(include_ok=False)
-        base_currency = _resolve_base_currency(settings, db)
-
     suffix = Path(file.filename or "upload.csv").suffix.lower()
-    if suffix not in supported_file_types:
-        supported = " or ".join(supported_file_types)
-        return JSONResponse(
-            {"error": f"Unsupported file type: {suffix}. Upload a {supported}"},
-            status_code=400,
-        )
+    if suffix not in {".csv", ".pdf", ".ofx"}:
+        return JSONResponse({"error": "Upload one of CSV, PDF, or OFX files."}, status_code=400)
+    content = await file.read(settings.max_upload_bytes + 1)
+    if len(content) > settings.max_upload_bytes:
+        return JSONResponse({"error": "Upload exceeds the configured size limit."}, status_code=413)
+    if not content:
+        return JSONResponse({"error": "The uploaded file is empty."}, status_code=400)
+    if not _UPLOAD_IMPORT_SLOTS.acquire(blocking=False):
+        return JSONResponse({"error": "Another import is in progress. Try again shortly."}, status_code=429)
 
-    # Read upload content now (before streaming response starts)
-    file_bytes = await file.read()
+    slot_lock = threading.Lock()
+    slot_released = False
 
-    async def _stream():
-        def evt(pct: int, step: str, **extra) -> str:
-            payload = _json.dumps({"pct": pct, "step": step, **extra})
-            return f"data: {payload}\n\n"
-
-        try:
-            # ── Phase 1: save to temp ──────────────────────────────
-            yield evt(5, "Saving file...")
-            import asyncio, tempfile, shutil
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-
-            # ── Phase 2: parse ─────────────────────────────────────
-            yield evt(15, "Parsing transactions...")
-            await asyncio.sleep(0)  # yield control so event is flushed
-            try:
-                if suffix == ".pdf":
-                    from spectra.pdf_parser import parse_pdf
-                    parsed = parse_pdf(tmp_path, currency=base_currency)
-                elif suffix == ".csv":
-                    from spectra.csv_parser import parse_csv
-                    parsed = parse_csv(tmp_path, currency=base_currency)
-                else:
-                    from spectra.ofx_parser import parse_ofx
-                    parsed = parse_ofx(tmp_path, currency=base_currency)
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
-
-            # ── Phase 3: dedup ─────────────────────────────────────
-            yield evt(25, "Checking for duplicates...")
-            await asyncio.sleep(0)
-            with _get_db() as db:
-                new_txns = [t for t in parsed if not db.is_seen(t.id)]
-                overrides = db.get_overrides()
-                category_rules = db.get_category_rules()
-                merchant_db = db.get_merchant_categories()
-                training_data = db.get_training_data()
-                import_batch_id = build_import_batch_id()
-
-            if not new_txns:
-                yield evt(100, "All transactions already imported", done=True,
-                          transactions=[], message="All transactions already imported")
+    def release_slot() -> None:
+        nonlocal slot_released
+        with slot_lock:
+            if slot_released:
                 return
+            slot_released = True
+        _UPLOAD_IMPORT_SLOTS.release()
 
-            n = len(new_txns)
+    def resolve_currency() -> tuple[str, bool]:
+        with LedgerClient(settings) as ledger:
+            status = _build_setup_status(settings, ledger)
+            return _resolve_base_currency(settings, ledger), bool(status["requires_base_currency_setup"])
 
-            # ── Phase 4: categorise (25% → 92%, per transaction) ───
-            # Pre-categorise from overrides (instant)
-            pre_cat = []
-            to_process = []
-            override_count = 0
-            rule_count = 0
-            for t in new_txns:
-                od = t.raw_description
-                counterpart = str(getattr(t, "counterpart", "") or "")
-                if od in overrides:
-                    pre_cat.append(CategorisedTransaction(
-                        id=t.id, original_description=od,
-                        clean_name=overrides[od]["clean_name"],
-                        category=overrides[od]["category"],
-                        amount=t.amount, currency=t.currency, date=t.date,
-                        counterpart=counterpart,
-                        classification_source="override",
-                        account_name=str(getattr(t, "account_name", "") or ""),
-                        import_batch_id=import_batch_id,
-                    ))
-                    override_count += 1
-                    continue
+    try:
+        base_currency, needs_setup = await run_in_threadpool(resolve_currency)
+        if needs_setup:
+            release_slot()
+            return _base_currency_setup_response(include_ok=False)
+    except ServiceUnavailable:
+        release_slot()
+        return JSONResponse({"error": "Ledger service is unavailable. Start the local Spectra services and retry."}, status_code=503)
+    except BaseException:
+        release_slot()
+        raise
 
-                from spectra.rules import first_matching_rule
+    async def events():
+        try:
+            yield f"data: {_json.dumps({'pct': 5, 'step': 'Upload received'})}\n\n"
+            async for event in ImportClient(settings).create_job_stream(
+                file.filename or f"statement{suffix}", content, base_currency,
+            ):
+                yield event
+        except ServiceUnavailable:
+            yield f"data: {_json.dumps({'pct': 0, 'step': 'Import service is unavailable. Start the local Spectra services and retry.', 'error': True})}\n\n"
+        finally:
+            release_slot()
 
-                matched_rule = first_matching_rule(
-                    category_rules,
-                    clean_name=counterpart or od,
-                    raw_description=od,
-                )
-                if matched_rule:
-                    pre_cat.append(CategorisedTransaction(
-                        id=t.id,
-                        original_description=od,
-                        clean_name=counterpart or od,
-                        category=str(matched_rule["category"]),
-                        amount=t.amount,
-                        currency=t.currency,
-                        date=t.date,
-                        counterpart=counterpart,
-                        classification_source="rule",
-                        account_name=str(getattr(t, "account_name", "") or ""),
-                        import_batch_id=import_batch_id,
-                    ))
-                    rule_count += 1
-                else:
-                    to_process.append(t)
+    return _SR(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no-cache",
+    }, background=BackgroundTask(release_slot))
 
-            if override_count or rule_count:
-                yield evt(
-                    28,
-                    f"Applied local mappings: {override_count} overrides, {rule_count} rules",
-                )
 
-            categorised = list(pre_cat)
+def _confirm_import_payload(
+    settings: Settings,
+    payloads: list[dict[str, Any]],
+    job_id: str | None = None,
+) -> dict[str, Any] | JSONResponse:
+    """Delegate review confirmation to the importer, which commits via ledger API."""
+    import asyncio
 
-            if to_process:
-                flat = [
-                    {
-                        "id": t.id,
-                        "raw_description": t.raw_description,
-                        "counterpart": getattr(t, "counterpart", ""),
-                        "statement_category": getattr(t, "statement_category", ""),
-                        "amount": t.amount,
-                        "currency": t.currency,
-                        "date": t.date,
-                    }
-                    for t in to_process
-                ]
-
-                if settings.ai_provider == "local":
-                    from spectra.local_categorizer import categorise_local
-                    from spectra.ml_classifier import train_classifier
-                    ml_clf = train_classifier(training_data)
-
-                    # Categorise one-by-one so we can stream real progress
-                    results = []
-                    for i, row in enumerate(flat):
-                        pct = 25 + int((i + 1) / len(flat) * 67)
-                        yield evt(pct, f"Categorizing {i + 1} / {len(flat)}...")
-                        await asyncio.sleep(0)
-                        r = categorise_local([row], merchant_db=merchant_db, ml_classifier=ml_clf)
-                        results.extend(r)
-                    categorised.extend(results)
-
-                else:
-                    # Cloud: categorise in one batch (can't stream per-row)
-                    from spectra.ai import categorise
-                    provider = settings.ai_provider
-                    if provider == "gemini":
-                        api_key, model = settings.gemini_api_key, settings.gemini_model
-                    else:
-                        api_key, model = settings.openai_api_key, settings.openai_model
-
-                    # Fake granular progress while waiting for API
-                    for pct in range(30, 88, 5):
-                        yield evt(pct, f"Waiting for {provider.title()} AI...")
-                        await asyncio.sleep(0.4)
-
-                    results = categorise(flat, [], provider=provider,
-                                         api_key=api_key, model=model,
-                                         base_currency=base_currency)
-                    categorised.extend(results)
-
-            _enrich_categorised_transactions(
-                categorised,
-                source_transactions=new_txns,
-                import_batch_id=import_batch_id,
-                provider=settings.ai_provider,
-            )
-
-            # ── Phase 5: recurring detection ───────────────────────
-            yield evt(94, "Detecting recurring payments...")
-            await asyncio.sleep(0)
-            with _get_db() as db:
-                history = db.get_merchant_history()
-            from spectra.recurring import apply_recurring_tags
-            apply_recurring_tags(categorised, history)
-
-            # ── Phase 6: FX conversion ─────────────────────────────
-            yield evt(97, "Converting currencies...")
-            await asyncio.sleep(0)
-            from spectra.fx import convert_currency
-            for t in categorised:
-                if t.currency.upper() != base_currency:
-                    orig_amt, orig_cur = t.amount, t.currency.upper()
-                    t.amount = convert_currency(orig_amt, orig_cur, base_currency, t.date)
-                    t.original_amount, t.original_currency = orig_amt, orig_cur
-                    t.currency = base_currency
-
-            for t in categorised:
-                apply_review_state(t)
-
-            with _get_db() as db:
-                existing_transfer_candidates = _load_existing_transfer_candidates(db, categorised)
-            match_internal_transfers(categorised, existing_candidates=existing_transfer_candidates)
-
-            # ── Done ───────────────────────────────────────────────
-            preview = [_serialize_transaction_model(t) for t in categorised]
-            review_count = sum(1 for item in categorised if item.needs_review)
-            transfer_count = sum(1 for item in categorised if item.transfer_status == TRANSFER_STATUS_SUGGESTED)
-            yield evt(100, f"{len(preview)} transactions ready", done=True,
-                      transactions=preview,
-                      message=f"{len(preview)} new transactions",
-                      review_count=review_count,
-                      transfer_count=transfer_count)
-
-        except Exception as e:
-            logger.exception("Upload stream error: %s", e)
-            yield f"data: {_json.dumps({'pct': 0, 'step': 'Error: ' + str(e), 'error': True})}\n\n"
-
-    return _SR(_stream(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",   # disable nginx buffering if behind proxy
-    })
-
+    try:
+        with LedgerClient(settings) as ledger:
+            setup = _build_setup_status(settings, ledger)
+        if setup["requires_base_currency_setup"]:
+            return _base_currency_setup_response(include_ok=True)
+        return asyncio.run(ImportClient(settings).confirm(job_id, payloads))
+    except ServiceUnavailable:
+        return JSONResponse(
+            {"ok": False, "message": "Import service is unavailable. Retry without changing this review."},
+            status_code=503,
+        )
+    except ServiceResponseError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "message": str(exc),
+                "retryable": exc.status_code >= 500,
+            },
+            status_code=exc.status_code if 400 <= exc.status_code < 600 else 502,
+        )
 
 
 @app.post("/api/confirm")
 async def api_confirm(request: Request):
-    """Confirm and save previously previewed transactions to the DB."""
+    """Confirm and atomically save reviewed transactions off the event loop."""
+    import asyncio
+
     body = await request.json()
     transactions = body.get("transactions", [])
-
-    if not transactions:
+    if not isinstance(transactions, list) or not transactions:
         return {"ok": False, "message": "No transactions to save"}
+    if any(not isinstance(item, dict) for item in transactions):
+        return JSONResponse({"error": "transactions must be a list of transaction objects"}, status_code=400)
 
     settings = load_settings()
-    with BookmarkDB(settings.db_path) as db:
-        if _build_setup_status(settings, db)["requires_base_currency_setup"]:
-            return _base_currency_setup_response(include_ok=True)
-        base_currency = _resolve_base_currency(settings, db)
-
-    with _get_db() as db:
-        cats: list[CategorisedTransaction] = []
-        future_mappings: dict[str, str] = {}
-        future_overrides: dict[str, dict[str, str]] = {}
-        learned_count = 0
-        if transactions and not transactions[0].get("import_batch_id"):
-            fallback_batch_id = build_import_batch_id()
-        else:
-            fallback_batch_id = ""
-        for t in transactions:
-            if fallback_batch_id and not t.get("import_batch_id"):
-                t["import_batch_id"] = fallback_batch_id
-            ct = _payload_to_transaction(t, base_currency=base_currency)
-            apply_review_state(ct)
-            cats.append(ct)
-
-            apply_to_future = _coerce_bool(t.get("apply_to_future"), True)
-            _persist_learning(
-                db,
-                tx_id=str(ct.id),
-                original_description=str(ct.original_description),
-                clean_name=str(ct.clean_name),
-                category=str(ct.category),
-                source="upload_confirm",
-                apply_to_future=apply_to_future,
-            )
-            if apply_to_future and ct.category != "Uncategorized":
-                future_mappings[ct.clean_name] = ct.category
-                if ct.original_description:
-                    future_overrides[ct.original_description] = {
-                        "clean_name": ct.clean_name,
-                        "category": ct.category,
-                    }
-                learned_count += 1
-
-        existing_transfer_candidates = _load_existing_transfer_candidates(db, cats)
-        existing_transfer_updates = match_internal_transfers(
-            cats,
-            existing_candidates=existing_transfer_candidates,
-        )
-        db.save_history(cats)
-        for update in existing_transfer_updates:
-            tx_id = str(update.pop("tx_id"))
-            db.update_transaction(tx_id, **update)
-        db.save_merchant_categories_batch(future_mappings)
-        db.save_overrides(future_overrides)
-        review_count = sum(1 for tx in cats if tx.needs_review)
-        transfer_count = sum(1 for tx in cats if tx.transfer_status == TRANSFER_STATUS_SUGGESTED)
-        redirect_to = "/review" if review_count else "/transactions"
-
-        # Optionally sync to Google Sheets
-        if settings.spreadsheet_id and (settings.google_sheets_credentials_b64 or
-                                         Path(settings.google_sheets_credentials_file).exists()):
-            try:
-                from spectra.sheets import SheetsClient
-                sheets = SheetsClient(
-                    spreadsheet_id=settings.spreadsheet_id,
-                    credentials_b64=settings.google_sheets_credentials_b64,
-                    credentials_file=settings.google_sheets_credentials_file,
-                )
-                sheets.append_transactions(cats)
-                from spectra.dashboard import refresh_dashboard
-                refresh_dashboard(sheets)
-                return {
-                    "ok": True,
-                    "message": f"Saved {len(cats)} transactions + synced to Sheets · {review_count} need review · {transfer_count} transfer suggestion(s) · learned {learned_count} future mapping(s)",
-                    "review_count": review_count,
-                    "transfer_count": transfer_count,
-                    "redirect_to": redirect_to,
-                }
-            except Exception as e:
-                logger.warning("Sheets sync failed: %s", e)
-                return {
-                    "ok": True,
-                    "message": f"Saved {len(cats)} transactions · {review_count} need review · {transfer_count} transfer suggestion(s) · learned {learned_count} future mapping(s) (Sheets sync failed)",
-                    "review_count": review_count,
-                    "transfer_count": transfer_count,
-                    "redirect_to": redirect_to,
-                }
-
-    return {
-        "ok": True,
-        "message": f"Saved {len(cats)} transactions to local DB · {review_count} need review · {transfer_count} transfer suggestion(s) · learned {learned_count} future mapping(s)",
-        "review_count": review_count,
-        "transfer_count": transfer_count,
-        "redirect_to": redirect_to,
-    }
-
-
-
-# ── Pages: Budget & Trends ───────────────────────────────────────
+    job_id = str(body.get("job_id", "") or "").strip() or None
+    if job_id:
+        return await asyncio.to_thread(_confirm_import_payload, settings, transactions, job_id)
+    return await asyncio.to_thread(_confirm_import_payload, settings, transactions)
 
 
 @app.get("/budget", response_class=HTMLResponse)
-async def page_budget(request: Request):
+def page_budget(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "budget.html", _template_context(request))
 
 
 @app.get("/trends", response_class=HTMLResponse)
-async def page_trends(request: Request):
+def page_trends(request: Request):
     if (redirect := _setup_redirect_if_needed(request)):
         return redirect
     return templates.TemplateResponse(request, "trends.html", _template_context(request))
@@ -1896,43 +1790,46 @@ async def page_trends(request: Request):
 
 
 @app.get("/api/budget")
-async def api_budget():
+def api_budget():
     """Return per-category budget status for the current month."""
     preferences = _load_app_preferences()
     current_cycle = _build_cycle_payload(preferences["cycle_rule"])
 
     with _get_db() as db:
+        base_currency = _resolve_base_currency(load_settings(), db)
         # All expense rows for the current financial cycle
-        rows = db._conn.execute(
-            """
-            SELECT category, SUM(amount) as total
-            FROM tx_history
-            WHERE amount < 0 AND excluded_from_spend = 0 AND date >= ? AND date < ?
-            GROUP BY category
-            """,
-            (current_cycle["start"], current_cycle["end"]),
-        ).fetchall()
+        rows = db.read_model(
+            "budget_expense_rows", start=current_cycle["start"],
+            end=current_cycle["end"], currency=base_currency,
+        )
+        spent_totals: dict[str, Decimal] = {}
+        for category, amount_text, legacy_amount in rows:
+            spent_totals[category] = spent_totals.get(category, Decimal(0)) + abs(
+                as_decimal(amount_text if amount_text is not None else legacy_amount)
+            )
+        non_base_currency_count = int(db.read_model(
+            "currency_count", start=current_cycle["start"], end=current_cycle["end"],
+            currency=base_currency,
+        ))
 
-        limits = db.get_budget_limits()
+        limits = db.get_budget_limits(base_currency)
+        exact_limits = db.get_budget_limits_exact(base_currency)
+        non_base_budget_count = db.count_non_base_budget_limits(base_currency)
 
         # All-time categories so we can show unspent ones too
-        all_cats = db._conn.execute(
-            """
-            SELECT DISTINCT category FROM tx_history
-            WHERE category != 'Uncategorized' AND amount < 0 AND excluded_from_spend = 0
-            ORDER BY category
-            """
-        ).fetchall()
+        all_cats = db.read_model("budget_categories", currency=base_currency)
 
-    spent_by_cat: dict[str, float] = {cat: abs(total) for cat, total in rows}
-    categories = sorted({row[0] for row in all_cats} | set(limits.keys()))
+    spent_by_cat: dict[str, Decimal] = spent_totals
+    categories = sorted(set(all_cats) | set(limits.keys()))
 
     items = []
     for cat in categories:
-        spent = round(spent_by_cat.get(cat, 0.0), 2)
-        limit = limits.get(cat)
-        if limit and limit > 0:
-            pct = round(spent / limit * 100, 1)
+        spent_decimal = quantize_money(spent_by_cat.get(cat, Decimal(0)), base_currency)
+        spent = float(spent_decimal)
+        limit_decimal = exact_limits.get(cat)
+        limit = float(limit_decimal) if limit_decimal is not None else None
+        if limit_decimal is not None and limit_decimal > 0:
+            pct = round(float(spent_decimal / limit_decimal * 100), 1)
             if pct >= 100:
                 status = "red"
             elif pct >= 80:
@@ -1960,30 +1857,42 @@ async def api_budget():
 
     return {
         "current_cycle": current_cycle,
+        "base_currency": base_currency,
+        "non_base_currency_count": non_base_currency_count,
+        "non_base_budget_count": non_base_budget_count,
         "items": items,
         "summary": {"on_track": on_track, "over": over, "no_limit": no_limit},
     }
 
 
 @app.patch("/api/budget/{category}")
-async def api_update_budget(category: str, request: Request):
+def api_update_budget(category: str, body: dict[str, Any]):
     """Save or update a monthly budget limit for a category."""
-    body = await request.json()
     limit = body.get("limit")
-    if limit is None or limit < 0:
+    try:
+        exact_limit = as_decimal(limit)
+    except ValueError:
+        return JSONResponse({"error": "limit must be a valid monetary amount"}, status_code=400)
+    if exact_limit < 0:
         return JSONResponse({"error": "limit must be a non-negative number"}, status_code=400)
 
     with _get_db() as db:
-        db.save_budget_limit(category, float(limit))
+        currency = _resolve_base_currency(load_settings(), db)
+        db.save_budget_limit(category, exact_limit, currency=currency)
 
-    return {"ok": True, "category": category, "limit": limit}
+    return {
+        "ok": True,
+        "category": category,
+        "currency": currency,
+        "limit": float(quantize_money(exact_limit, currency)),
+    }
 
 
 # ── API: Trends ──────────────────────────────────────────────────
 
 
 @app.get("/api/trends")
-async def api_trends():
+def api_trends():
     """Return year-over-year financial data for the Trends page."""
     from collections import defaultdict
 
@@ -1991,27 +1900,35 @@ async def api_trends():
     cycle_rule = preferences["cycle_rule"]
 
     with _get_db() as db:
-        rows = db._conn.execute(
-            "SELECT date, amount, category FROM tx_history WHERE excluded_from_spend = 0 ORDER BY date ASC"
-        ).fetchall()
+        base_currency = _resolve_base_currency(load_settings(), db)
+        rows = db.read_model("trend_rows", currency=base_currency)
+        non_base_currency_count = int(db.read_model(
+            "all_time_currency_count", currency=base_currency,
+        ))
 
     if not rows:
-        return {"years": [], "by_year": {}, "period_series": [], **preferences}
+        return {
+            "years": [], "by_year": {}, "period_series": [],
+            "base_currency": base_currency,
+            "non_base_currency_count": non_base_currency_count,
+            **preferences,
+        }
 
     # Aggregate by year and month
     by_year: dict[str, dict] = {}
-    monthly_income: dict[str, float] = defaultdict(float)
-    monthly_expense: dict[str, float] = defaultdict(float)
-    cat_by_year: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    monthly_income: dict[str, Decimal] = defaultdict(Decimal)
+    monthly_expense: dict[str, Decimal] = defaultdict(Decimal)
+    cat_by_year: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
 
-    for date_str, amount, category in rows:
+    for date_str, amount_text, category in rows:
+        amount = as_decimal(amount_text)
         tx_date = parse_iso_date(date_str)
         cycle_start = cycle_start_for(tx_date, cycle_rule)
         year = str(cycle_start.year)
         month = cycle_start.isoformat()
 
         if year not in by_year:
-            by_year[year] = {"income": 0.0, "expenses": 0.0}
+            by_year[year] = {"income": Decimal(0), "expenses": Decimal(0)}
 
         if amount > 0:
             by_year[year]["income"] += amount
@@ -2026,16 +1943,19 @@ async def api_trends():
     years = sorted(by_year.keys())
     year_stats = {}
     for y in years:
-        inc = round(by_year[y]["income"], 2)
-        exp = round(by_year[y]["expenses"], 2)
-        net = round(inc - exp, 2)
-        savings_rate = round((net / inc * 100), 1) if inc > 0 else 0.0
+        inc_decimal = quantize_money(by_year[y]["income"], base_currency)
+        exp_decimal = quantize_money(by_year[y]["expenses"], base_currency)
+        net_decimal = quantize_money(inc_decimal - exp_decimal, base_currency)
+        inc = float(inc_decimal)
+        exp = float(exp_decimal)
+        net = float(net_decimal)
+        savings_rate = round(float(net_decimal / inc_decimal * 100), 1) if inc_decimal > 0 else 0.0
         year_stats[y] = {
             "income": inc,
             "expenses": exp,
             "net": net,
             "savings_rate": savings_rate,
-            "by_category": {k: round(v, 2) for k, v in sorted(
+            "by_category": {k: float(quantize_money(v, base_currency)) for k, v in sorted(
                 cat_by_year[y].items(), key=lambda x: -x[1]
             )[:8]},  # top 8 categories
         }
@@ -2046,8 +1966,8 @@ async def api_trends():
         {
             "period_start": m,
             "period_end": next_cycle_start(parse_iso_date(m), cycle_rule).isoformat(),
-            "income": round(monthly_income.get(m, 0), 2),
-            "expenses": round(monthly_expense.get(m, 0), 2),
+            "income": float(quantize_money(monthly_income.get(m, Decimal(0)), base_currency)),
+            "expenses": float(quantize_money(monthly_expense.get(m, Decimal(0)), base_currency)),
         }
         for m in all_months
     ]
@@ -2056,12 +1976,14 @@ async def api_trends():
         "years": years,
         "by_year": year_stats,
         "period_series": monthly_series,
+        "base_currency": base_currency,
+        "non_base_currency_count": non_base_currency_count,
         **preferences,
     }
 
 
 @app.get("/api/subscriptions")
-async def api_subscriptions():
+def api_subscriptions():
     """Return recurring subscriptions with monthly and annual projections."""
     from collections import defaultdict
     from datetime import date, timedelta
@@ -2071,31 +1993,29 @@ async def api_subscriptions():
     cycle_start, cycle_end = cycle_window_for(date.today(), preferences["cycle_rule"])
 
     with _get_db() as db:
-        rows = db._conn.execute(
-            """
-            SELECT date, clean_name, amount, category, COALESCE(original_description, '')
-            FROM tx_history
-            WHERE excluded_from_spend = 0
-            ORDER BY date ASC
-            """
-        ).fetchall()
+        base_currency = _resolve_base_currency(load_settings(), db)
+        rows = db.read_model("subscription_rows", currency=base_currency)
+        non_base_currency_count = int(db.read_model(
+            "all_time_currency_count", currency=base_currency,
+        ))
 
     buckets: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "name": "",
             "dates": [],
             "amounts": [],
-            "in_cycle": 0.0,
+            "in_cycle": Decimal(0),
             "last_date": "",
             "category": "Digital Subscriptions",
         }
     )
 
-    for date_str, clean_name, amount, category, original_description in rows:
+    for date_str, clean_name, amount_text, category, original_description in rows:
+        amount = as_decimal(amount_text)
         if amount >= 0:
             continue
 
-        recurring_kind = detect_recurring_kind(clean_name, original_description, amount)
+        recurring_kind = detect_recurring_kind(clean_name, original_description, float(amount))
         if recurring_kind != "Subscription" and category != "Digital Subscriptions":
             continue
 
@@ -2104,14 +2024,14 @@ async def api_subscriptions():
         bucket["name"] = clean_name
         bucket["category"] = category or "Digital Subscriptions"
         bucket["dates"].append(tx_date)
-        bucket["amounts"].append(abs(float(amount)))
+        bucket["amounts"].append(abs(amount))
         if cycle_start <= tx_date < cycle_end:
-            bucket["in_cycle"] += abs(float(amount))
+            bucket["in_cycle"] += abs(amount)
         if date_str > bucket["last_date"]:
             bucket["last_date"] = date_str
 
     items: list[dict[str, Any]] = []
-    monthly_total = 0.0
+    monthly_total = Decimal(0)
     price_change_count = 0
 
     for merchant, bucket in buckets.items():
@@ -2120,7 +2040,7 @@ async def api_subscriptions():
         if not amounts:
             continue
 
-        avg_amount = sum(amounts) / len(amounts)
+        avg_amount = sum(amounts, Decimal(0)) / Decimal(len(amounts))
         intervals = [
             (dates[i] - dates[i - 1]).days
             for i in range(1, len(dates))
@@ -2129,7 +2049,7 @@ async def api_subscriptions():
         cadence_days = int(round(median(intervals))) if intervals else 30
         cadence_days = max(cadence_days, 1)
 
-        monthly_estimate = avg_amount * (30.4375 / cadence_days)
+        monthly_estimate = avg_amount * (Decimal("30.4375") / Decimal(cadence_days))
         annual_projection = monthly_estimate * 12
         monthly_total += monthly_estimate
 
@@ -2137,10 +2057,10 @@ async def api_subscriptions():
         next_charge = last_date + timedelta(days=cadence_days)
         previous_amounts = amounts[:-1]
         baseline_amount = median(previous_amounts) if previous_amounts else amounts[-1]
-        change_amount = round(amounts[-1] - baseline_amount, 2)
-        change_pct = round((change_amount / baseline_amount) * 100, 1) if baseline_amount else 0.0
+        change_amount = quantize_money(amounts[-1] - baseline_amount, base_currency)
+        change_pct = round(float(change_amount / baseline_amount * 100), 1) if baseline_amount else 0.0
         price_change_direction = ""
-        if previous_amounts and abs(change_amount) >= max(1.0, baseline_amount * 0.08):
+        if previous_amounts and abs(change_amount) >= max(Decimal(1), baseline_amount * Decimal("0.08")):
             price_change_direction = "up" if change_amount > 0 else "down"
             price_change_count += 1
 
@@ -2148,30 +2068,35 @@ async def api_subscriptions():
             {
                 "merchant": merchant,
                 "category": bucket["category"],
-                "last_amount": round(amounts[-1], 2),
-                "average_amount": round(avg_amount, 2),
+                "last_amount": float(quantize_money(amounts[-1], base_currency)),
+                "average_amount": float(quantize_money(avg_amount, base_currency)),
                 "cadence_days": cadence_days,
                 "last_charge_date": last_date.isoformat(),
                 "next_estimated_date": next_charge.isoformat(),
-                "monthly_estimate": round(monthly_estimate, 2),
-                "annual_projection": round(annual_projection, 2),
-                "in_current_cycle": round(bucket["in_cycle"], 2),
+                "monthly_estimate": float(quantize_money(monthly_estimate, base_currency)),
+                "annual_projection": float(quantize_money(annual_projection, base_currency)),
+                "in_current_cycle": float(quantize_money(bucket["in_cycle"], base_currency)),
                 "payments_count": len(amounts),
                 "price_change_direction": price_change_direction,
-                "change_amount": change_amount,
+                "change_amount": float(change_amount),
                 "change_pct": change_pct,
             }
         )
 
     items.sort(key=lambda row: row["monthly_estimate"], reverse=True)
+    current_cycle_total = sum(
+        (bucket["in_cycle"] for bucket in buckets.values()), Decimal(0),
+    )
 
     return {
         "items": items,
+        "base_currency": base_currency,
+        "non_base_currency_count": non_base_currency_count,
         "summary": {
             "active_count": len(items),
-            "monthly_estimate": round(monthly_total, 2),
-            "annual_projection": round(monthly_total * 12, 2),
-            "in_current_cycle": round(sum(item["in_current_cycle"] for item in items), 2),
+            "monthly_estimate": float(quantize_money(monthly_total, base_currency)),
+            "annual_projection": float(quantize_money(monthly_total * 12, base_currency)),
+            "in_current_cycle": float(quantize_money(current_cycle_total, base_currency)),
             "price_change_count": price_change_count,
         },
         "current_cycle": {

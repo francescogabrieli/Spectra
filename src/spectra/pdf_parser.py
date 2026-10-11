@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 from pathlib import Path
 
 from spectra.csv_parser import (
     ParsedTransaction,
-    _detect_delimiter,
     _make_id,
     _map_columns,
     _parse_amount,
     _parse_date,
+    _safe_account_label,
 )
+from spectra.money import decimal_text
 
 logger = logging.getLogger("spectra.pdf_parser")
 
@@ -47,7 +49,7 @@ def parse_pdf(
     if not path.exists():
         raise FileNotFoundError(f"PDF file not found: {path}")
 
-    logger.info("Parsing PDF: %s", path.name)
+    logger.info("Parsing PDF statement")
 
     with pdfplumber.open(path) as pdf:
         # ── Strategy 1: Table extraction ─────────────────────────
@@ -70,26 +72,23 @@ def parse_pdf(
                 chosen = table_transactions
                 source = "table"
             logger.info(
-                "PDF extraction: %d table + %d text transactions → using %s (%d rows) from %s",
+                "PDF extraction: %d table + %d text transactions; using %s (%d rows)",
                 len(table_transactions),
                 len(text_transactions),
                 source,
                 len(chosen),
-                path.name,
             )
             return chosen
         elif table_transactions:
             logger.info(
-                "Table extraction: %d transactions from %s",
+                "Table extraction: %d transactions",
                 len(table_transactions),
-                path.name,
             )
             return table_transactions
         else:
             logger.info(
-                "Text extraction: %d transactions from %s",
+                "Text extraction: %d transactions",
                 len(text_transactions),
-                path.name,
             )
             return text_transactions
 
@@ -135,6 +134,7 @@ def _rows_to_transactions(
     col = _map_columns(header)
     transactions: list[ParsedTransaction] = []
     skipped = 0
+    occurrences: dict[tuple[str, str, float, str, str], int] = {}
 
     for row in rows:
         if not any(c.strip() for c in row):
@@ -164,17 +164,37 @@ def _rows_to_transactions(
             statement_category = row[col["category"]].strip() if "category" in col else ""
             statement_category = statement_category.replace("€", "").strip()
 
+            row_currency = row[col["currency"]].strip().upper() if "currency" in col and col["currency"] < len(row) else currency.upper()
+            account_identity = row[col["account"]].strip() if "account" in col and col["account"] < len(row) else ""
+            account_name = _safe_account_label(account_identity)
+            account_id = (
+                "acct-" + hashlib.sha256(
+                    f"{account_identity.casefold()}|{row_currency.upper()}".encode("utf-8")
+                ).hexdigest()[:20]
+                if account_identity else ""
+            )
+            fingerprint = (date, description.casefold(), round(float(amount), 2), row_currency, account_identity.casefold())
+            occurrence = occurrences.get(fingerprint, 0)
+            occurrences[fingerprint] = occurrence + 1
+
             transactions.append(ParsedTransaction(
-                id=_make_id(date, description, amount),
+                id=_make_id(
+                    date, description, amount, account_name=account_identity,
+                    currency=row_currency, occurrence=occurrence,
+                ),
                 date=date,
                 amount=amount,
-                currency=currency,
+                currency=row_currency,
                 raw_description=description,
+                amount_decimal=decimal_text(amount, row_currency),
                 statement_category=statement_category,
+                account_name=account_name,
+                account_id=account_id,
+                legacy_id=_make_id(date, description, amount),
             ))
-        except (ValueError, IndexError) as e:
+        except (ValueError, IndexError):
             skipped += 1
-            logger.debug("Skipping row: %s — %s", row, e)
+            logger.debug("Skipping malformed PDF table row")
 
     if skipped:
         logger.warning("Skipped %d malformed rows", skipped)
@@ -193,7 +213,7 @@ _TX_PATTERN = re.compile(
     r"(?P<desc>.+?)"  # description (lazy)
     r"\s+"
     r"(?P<amount>[+\-]?\s*[\d\.,]+)"  # amount
-    r"\s*(?:EUR|USD|GBP|CHF)?\s*$",  # optional currency
+    r"\s*(?P<currency>[A-Z]{3})?\s*$",  # optional currency
     re.IGNORECASE,
 )
 
@@ -206,7 +226,7 @@ _BANK_TX_PATTERN = re.compile(
     r"(?P<category>.+?)"
     r"\s+"
     r"(?P<amount>[+\-]?\s*[\d\.,]+)"
-    r"\s*(?:EUR|USD|GBP|CHF)?\s*$",
+    r"\s*(?P<currency>[A-Z]{3})?\s*$",
     re.IGNORECASE,
 )
 
@@ -255,6 +275,7 @@ def _extract_from_text_with_pypdf(
 ) -> list[ParsedTransaction]:
     """Regex-based fallback: scan each line for date + description + amount."""
     transactions: list[ParsedTransaction] = []
+    occurrences: dict[tuple[str, str, str], int] = {}
     reader = pdf_reader_cls(str(file_path))
 
     for page in reader.pages:
@@ -268,13 +289,22 @@ def _extract_from_text_with_pypdf(
                 date = _parse_date(m.group("date"))
                 description = m.group("desc").strip()
                 amount = _parse_amount(m.group("amount").replace(" ", ""))
+                currency_code = str(m.groupdict().get("currency") or currency).strip().upper()
+                fingerprint = (date, description.casefold(), decimal_text(amount, currency_code))
+                occurrence = occurrences.get(fingerprint, 0)
+                occurrences[fingerprint] = occurrence + 1
 
                 transactions.append(ParsedTransaction(
-                    id=_make_id(date, description, amount),
+                    id=_make_id(
+                        date, description, amount, currency=currency_code,
+                        occurrence=occurrence,
+                    ),
                     date=date,
                     amount=amount,
-                    currency=currency,
+                    currency=currency_code,
                     raw_description=description,
+                    amount_decimal=decimal_text(amount, currency_code),
+                    legacy_id=_make_id(date, description, amount),
                     statement_category=(
                         m.group("category").replace("€", "").strip()
                         if "category" in m.groupdict()

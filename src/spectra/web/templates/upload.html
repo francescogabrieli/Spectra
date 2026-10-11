@@ -37,7 +37,8 @@
     </article>
 </section>
 
-<div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+<div class="upload-zone" id="uploadZone" role="button" tabindex="0" aria-label="Choose a bank export file"
+    onclick="document.getElementById('fileInput').click()">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
         stroke-linecap="round" stroke-linejoin="round" style="opacity:.4;margin-bottom:12px;">
         <polyline points="16 16 12 12 8 16" />
@@ -92,6 +93,8 @@
         <span>Edit merchants and categories inline. Use “Apply to similar” to propagate the current fix in this batch. Keep “Learn” on when the correction should improve future imports too.</span>
     </div>
 
+    <div class="confirm-error-note" id="confirmError" role="alert" style="display:none;"></div>
+
     <div class="table-container">
         <table>
             <thead>
@@ -114,6 +117,7 @@
 {% block scripts %}
 <script>
     let previewData = [];
+    let previewJobId = null;
     let previewCategories = [];
 
     const zone = document.getElementById('uploadZone');
@@ -305,6 +309,12 @@
     // Drag & drop
     zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
     zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    zone.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            fileInput.click();
+        }
+    });
     zone.addEventListener('drop', e => {
         e.preventDefault();
         zone.classList.remove('drag-over');
@@ -377,6 +387,7 @@
                             ...item,
                             apply_to_future: item.apply_to_future !== false,
                         }));
+                        previewJobId = event.job_id || null;
                         showPreview(previewData, event.message);
                     }
                 }
@@ -487,6 +498,7 @@
         document.getElementById('previewSection').classList.remove('visible');
         document.getElementById('uploadZone').style.display = '';
         previewData = [];
+        previewJobId = null;
         fileInput.value = '';
         updatePreviewSummary();
     }
@@ -500,16 +512,25 @@
             const res = await fetch('/api/confirm', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ transactions: previewData }),
+                body: JSON.stringify({ job_id: previewJobId, transactions: previewData }),
             });
-            const data = await res.json();
+            const data = await res.json().catch(() => ({}));
+            const message = data.message || data.error || data.detail || ('Server error ' + res.status);
+            if (!res.ok || data.ok === false || data.error) {
+                throw new Error(message);
+            }
+            document.getElementById('confirmError').style.display = 'none';
             showToast(data.message || 'Transactions saved!');
 
             setTimeout(() => { window.location.href = data.redirect_to || '/transactions'; }, 1500);
         } catch (err) {
-            showToast('Save failed: ' + err.message, 'error');
+            const message = 'Could not save this review. ' + (err.message || 'Please retry.');
+            const errorNotice = document.getElementById('confirmError');
+            errorNotice.textContent = message;
+            errorNotice.style.display = '';
+            showToast(message, 'error');
             btn.disabled = false;
-            btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Confirm & Save`;
+            btn.textContent = 'Confirm & Save';
         }
     }
 

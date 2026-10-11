@@ -2,8 +2,12 @@
 {% block title %}Trends — Spectra{% endblock %}
 
 {% block content %}
-<h1 class="page-title">Trends</h1>
-<p class="page-subtitle">Year-over-year financial overview by financial cycle</p>
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Trends</h1>
+        <p class="page-subtitle">Year-over-year financial overview by financial cycle</p>
+    </div>
+</div>
 
 <!-- Year tabs -->
 <div class="year-tabs" id="yearTabs"></div>
@@ -32,14 +36,14 @@
 <div class="charts-row">
     <div class="chart-box" style="grid-column: 1 / -1;">
         <h3>Income vs Expenses — Monthly</h3>
-        <canvas id="monthlyChart" height="160"></canvas>
+        <div id="monthlyChart" class="trend-chart"></div>
     </div>
 </div>
 
 <div class="charts-row">
     <div class="chart-box" style="grid-column: 1 / -1;">
         <h3>Top Spending Categories</h3>
-        <canvas id="categoryChart" height="200"></canvas>
+        <div id="categoryChart" class="trend-chart"></div>
     </div>
 </div>
 
@@ -49,8 +53,6 @@
 <script>
     let trendsData = null;
     let selectedYear = null;
-    let monthlyChart = null;
-    let categoryChart = null;
 
     function cssVar(name, fallback = '') {
         return window.SpectraTheme?.getCssVar(name, fallback) || fallback;
@@ -104,19 +106,33 @@
         return formatSpectraDate(periodStart, { day: 'numeric', month: 'short' });
     }
 
+    function escapeTrendText(value) {
+        return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+    }
+
     async function loadTrends() {
         await loadCurrency();
         const res = await fetch('/api/trends');
         trendsData = await res.json();
 
         if (!trendsData.years.length) {
+            const excludedCount = Number(trendsData.non_base_currency_count || 0);
+            const currency = String(trendsData.base_currency || defaultCurrency || 'EUR').toUpperCase();
             document.getElementById('yearTabs').innerHTML = '';
+            document.querySelector('.page-subtitle').textContent = excludedCount
+                ? `${excludedCount} transaction(s) in another or unknown currency are excluded from ${currency} trends.`
+                : 'Year-over-year financial overview by financial cycle';
             document.getElementById('yearCards').innerHTML = `
                 <div class="empty-state" style="grid-column:1/-1">
-                    <div class="icon">📈</div>
-                    <h3>No data yet</h3>
-                    <p>Upload bank exports to see trends over time</p>
-                    <a href="/upload" class="btn btn-primary" style="margin-top:16px;">📤 Upload Transactions</a>
+                    <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 18h18M5 15l5-5 4 3 6-7"/><path d="M15 6h5v5"/></svg></div>
+                    <h3>${excludedCount ? `No transactions in ${escapeTrendText(currency)}` : 'No data yet'}</h3>
+                    <p>${excludedCount
+                        ? 'These records remain in Transactions and exports. Confirm their denomination in Settings to include compatible history in currency-specific totals.'
+                        : 'Upload bank exports to see trends over time'}</p>
+                    ${excludedCount
+                        ? '<a href="/settings" class="btn btn-primary" style="margin-top:16px;">Review historical currencies</a>'
+                        : '<a href="/upload" class="btn btn-primary" style="margin-top:16px;">Upload Transactions</a>'}
                 </div>`;
             return;
         }
@@ -159,125 +175,75 @@
         const theme = getTrendTheme();
         const series = trendsData.period_series.filter(m => m.period_start.startsWith(year));
         const labels = series.map(m => formatPeriodTick(m.period_start));
+        const chart = document.getElementById('monthlyChart');
+        if (!series.length) {
+            chart.innerHTML = '<p class="chart-empty">No data for this year.</p>';
+            return;
+        }
 
-        if (monthlyChart) monthlyChart.destroy();
-        monthlyChart = new Chart(document.getElementById('monthlyChart'), {
-            type: 'bar',
-            data: {
-                labels,
-                datasets: [
-                    {
-                        label: 'Income',
-                        data: series.map(m => m.income),
-                        backgroundColor: theme.incomeFill,
-                        borderRadius: 6,
-                        borderSkipped: false,
-                    },
-                    {
-                        label: 'Expenses',
-                        data: series.map(m => m.expenses),
-                        backgroundColor: theme.expenseFill,
-                        borderRadius: 6,
-                        borderSkipped: false,
-                    },
-                ],
-            },
-            options: {
-                responsive: true,
-                animation: { duration: 600, easing: 'easeOutQuart' },
-                plugins: {
-                    legend: {
-                        labels: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 12 },
-                            usePointStyle: true,
-                        },
-                    },
-                    tooltip: {
-                        callbacks: {
-                            title: ctx => formatCycleRange(series[ctx[0].dataIndex].period_start, series[ctx[0].dataIndex].period_end),
-                            label: ctx => `${ctx.dataset.label}: ${formatCurrency(ctx.raw)}`
-                        }
-                    }
-                },
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 11 },
-                            callback: v => '€' + v.toLocaleString('it-IT'),
-                        },
-                        grid: { color: theme.gridColor },
-                    },
-                    x: {
-                        ticks: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 11 },
-                        },
-                        grid: { display: false },
-                    },
-                },
-            },
-        });
+        const width = 900, height = 300, left = 88, right = 20, top = 42, bottom = 48;
+        const plotWidth = width - left - right, plotHeight = height - top - bottom;
+        const values = series.flatMap(item => [Number(item.income || 0), Number(item.expenses || 0)]);
+        const maxValue = Math.max(...values, 1);
+        const grid = Array.from({ length: 4 }, (_, index) => {
+            const ratio = index / 3;
+            const y = top + plotHeight * ratio;
+            const value = maxValue * (1 - ratio);
+            return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="${theme.gridColor}"/>
+                <text x="${left - 10}" y="${y + 4}" text-anchor="end" fill="${theme.mutedColor}" font-size="11">${escapeTrendText(formatCurrency(value))}</text>`;
+        }).join('');
+        const band = plotWidth / series.length;
+        const barWidth = Math.min(24, Math.max(5, band * 0.27));
+        const bars = series.map((item, index) => {
+            const center = left + band * (index + 0.5);
+            const income = Number(item.income || 0);
+            const expenses = Number(item.expenses || 0);
+            const incomeHeight = income > 0 ? Math.max(2, income / maxValue * plotHeight) : 0;
+            const expenseHeight = expenses > 0 ? Math.max(2, expenses / maxValue * plotHeight) : 0;
+            const title = formatCycleRange(item.period_start, item.period_end);
+            return `<g><title>${escapeTrendText(title)} · Income ${escapeTrendText(formatCurrency(income))} · Expenses ${escapeTrendText(formatCurrency(expenses))}</title>
+                <rect x="${center - barWidth - 2}" y="${top + plotHeight - incomeHeight}" width="${barWidth}" height="${incomeHeight}" rx="4" fill="${theme.incomeFill}"/>
+                <rect x="${center + 2}" y="${top + plotHeight - expenseHeight}" width="${barWidth}" height="${expenseHeight}" rx="4" fill="${theme.expenseFill}"/>
+                <text x="${center}" y="${height - 14}" text-anchor="middle" fill="${theme.mutedColor}" font-size="11">${escapeTrendText(labels[index])}</text></g>`;
+        }).join('');
+        const legendY = 18;
+        chart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Income and expenses by month for ${escapeTrendText(year)}">
+            <rect x="${width / 2 - 78}" y="${legendY - 9}" width="10" height="10" rx="3" fill="${theme.incomeFill}"/><text x="${width / 2 - 63}" y="${legendY}" fill="${theme.mutedColor}" font-size="12">Income</text>
+            <rect x="${width / 2 + 8}" y="${legendY - 9}" width="10" height="10" rx="3" fill="${theme.expenseFill}"/><text x="${width / 2 + 23}" y="${legendY}" fill="${theme.mutedColor}" font-size="12">Expenses</text>
+            ${grid}${bars}</svg>`;
     }
 
     function renderCategoryChart(year) {
         const theme = getTrendTheme();
         const cats = trendsData.by_year[year]?.by_category || {};
-        const labels = Object.keys(cats);
-        const values = Object.values(cats);
+        const entries = Object.entries(cats).filter(([, value]) => Number(value) > 0);
+        const chart = document.getElementById('categoryChart');
 
-        if (categoryChart) categoryChart.destroy();
-
-        if (!labels.length) {
-            document.getElementById('categoryChart').parentElement.style.display = 'none';
+        if (!entries.length) {
+            chart.innerHTML = '<p class="chart-empty">No spending categories for this year.</p>';
             return;
         }
-        document.getElementById('categoryChart').parentElement.style.display = '';
-
-        categoryChart = new Chart(document.getElementById('categoryChart'), {
-            type: 'bar',
-            data: {
-                labels,
-                datasets: [{
-                    label: 'Spending',
-                    data: values,
-                    backgroundColor: theme.palette.slice(0, labels.length),
-                    borderRadius: 6,
-                    borderSkipped: false,
-                }],
-            },
-            options: {
-                indexAxis: 'y',
-                responsive: true,
-                animation: { duration: 700, easing: 'easeOutQuart' },
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        callbacks: { label: ctx => formatCurrency(ctx.raw) }
-                    }
-                },
-                scales: {
-                    x: {
-                        beginAtZero: true,
-                        ticks: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 11 },
-                            callback: v => '€' + v.toLocaleString('it-IT'),
-                        },
-                        grid: { color: theme.gridColor },
-                    },
-                    y: {
-                        ticks: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 12 },
-                        },
-                        grid: { display: false },
-                    },
-                },
-            },
-        });
+        const width = 900, left = 220, right = 100, top = 12;
+        const rowHeight = 34, height = top + entries.length * rowHeight + 12;
+        const plotWidth = width - left - right;
+        const maxValue = Math.max(...entries.map(([, value]) => Number(value)), 1);
+        const grid = Array.from({ length: 4 }, (_, index) => {
+            const x = left + plotWidth * index / 3;
+            const value = maxValue * index / 3;
+            return `<line x1="${x}" y1="${top - 6}" x2="${x}" y2="${height - 10}" stroke="${theme.gridColor}"/>
+                <text x="${x}" y="${height - 1}" text-anchor="middle" fill="${theme.mutedColor}" font-size="10">${escapeTrendText(formatCurrency(value))}</text>`;
+        }).join('');
+        const bars = entries.map(([label, rawValue], index) => {
+            const value = Number(rawValue);
+            const y = top + index * rowHeight;
+            const barWidth = Math.max(2, value / maxValue * plotWidth);
+            const color = theme.palette[index % theme.palette.length];
+            return `<g><title>${escapeTrendText(label)} · ${escapeTrendText(formatCurrency(value))}</title>
+                <text x="${left - 12}" y="${y + 17}" text-anchor="end" fill="${theme.mutedColor}" font-size="12">${escapeTrendText(label)}</text>
+                <rect x="${left}" y="${y + 3}" width="${barWidth}" height="20" rx="5" fill="${alphaColor(color, 0.82)}"/>
+                <text x="${Math.min(left + barWidth + 8, width - right + 4)}" y="${y + 17}" fill="${theme.mutedColor}" font-size="11">${escapeTrendText(formatCurrency(value))}</text></g>`;
+        }).join('');
+        chart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Spending by category in ${escapeTrendText(year)}">${grid}${bars}</svg>`;
     }
 
     window.addEventListener('spectra-theme-change', () => {

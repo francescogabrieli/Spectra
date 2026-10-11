@@ -1,6 +1,3 @@
-import sys
-from unittest.mock import MagicMock
-
 from spectra.recurring import apply_recurring_tags
 
 

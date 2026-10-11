@@ -55,7 +55,7 @@
     </div>
     <div id="reviewList" class="review-list">
         <div class="empty-state">
-            <div class="icon">⏳</div>
+            <div class="icon" aria-hidden="true"><span class="loading-indicator"></span></div>
             <h3>Loading…</h3>
         </div>
     </div>
@@ -168,12 +168,17 @@
         </div>`;
     }
 
+    function formatReviewAmount(item) {
+        if (item.currency) return formatCurrency(item.amount, item.currency);
+        return `${escapeHtml(item.amount_decimal ?? String(item.amount))} · currency unknown`;
+    }
+
     function renderReviewItems(items) {
         const container = document.getElementById('reviewList');
         if (!items.length) {
             container.innerHTML = `
                 <div class="empty-state">
-                    <div class="icon">✅</div>
+                    <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/></svg></div>
                     <h3>All caught up</h3>
                     <p>No items currently need review.</p>
                     <a href="/transactions" class="btn btn-primary" style="margin-top:16px;">Open Transactions</a>
@@ -194,7 +199,7 @@
                             ${item.import_batch_id ? `<span class="settings-badge">${escapeHtml(item.import_batch_id)}</span>` : ''}
                         </div>
                     </div>
-                    <div class="review-amount ${item.amount < 0 ? 'expense' : 'income'}">${formatCurrency(item.amount, item.currency)}</div>
+                    <div class="review-amount ${item.amount < 0 ? 'expense' : 'income'}">${formatReviewAmount(item)}</div>
                 </div>
                 <div class="review-grid">
                     <label class="review-field">

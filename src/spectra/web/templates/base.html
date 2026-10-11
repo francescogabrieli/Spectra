@@ -62,14 +62,17 @@
 
         applyTheme(getThemePreference());
     </script>
-    <link rel="stylesheet" href="/static/styles.css?v=20260515b">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20261011a">
+    <link rel="stylesheet" href="/static/apple.css?v=20261011b">
 </head>
 
-<body>
-    <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()">☰</button>
+<body data-page="{{ request.url.path }}">
+    <button class="menu-toggle" id="menuToggle" type="button" aria-label="Open navigation"
+        aria-controls="sidebar" aria-expanded="false" onclick="toggleSidebar()">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+    </button>
 
-    <aside class="sidebar" id="sidebar">
+    <aside class="sidebar" id="sidebar" aria-label="Spectra navigation">
         <div class="sidebar-brand">
             <svg class="brand-icon" width="28" height="24" viewBox="0 0 36 30" fill="none">
                 <!-- Spectra icon body -->
@@ -84,10 +87,12 @@
                 <line x1="22" y1="18" x2="36" y2="21" stroke="#2EAADC" stroke-width="2" stroke-linecap="round" />
                 <line x1="22" y1="20" x2="36" y2="25" stroke="#9B51E0" stroke-width="2" stroke-linecap="round" />
             </svg>
-            Spectra
+            <span>Spectra</span>
+            <span class="sidebar-brand-caption">PERSONAL FINANCE</span>
         </div>
-        <nav>
+        <nav aria-label="Main navigation">
             <ul class="sidebar-nav">
+                <li class="sidebar-nav-heading">Overview</li>
                 <li><a href="/" class="{% if request.url.path == '/' %}active{% endif %}">
                         <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"
                             stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -126,6 +131,7 @@
                         </svg>
                         Trends
                     </a></li>
+                <li class="sidebar-nav-heading">Activity</li>
                 <li><a href="/review" class="{% if request.url.path == '/review' %}active{% endif %}">
                         <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"
                             stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -153,6 +159,7 @@
                         </svg>
                         Upload
                     </a></li>
+                <li class="sidebar-nav-heading">Preferences</li>
                 <li><a href="/settings" class="{% if request.url.path == '/settings' %}active{% endif %}">
                         <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"
                             stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -170,6 +177,29 @@
     </aside>
 
     <main class="main">
+        <header class="app-topbar">
+            <div class="app-topbar-context">
+                <span class="app-topbar-kicker">SPECTRA · PERSONAL FINANCE</span>
+                <span class="app-topbar-location">
+                    {% if request.url.path == '/' %}Overview
+                    {% elif request.url.path == '/transactions' %}Transactions
+                    {% elif request.url.path == '/budget' %}Budget
+                    {% elif request.url.path == '/trends' %}Trends
+                    {% elif request.url.path == '/review' %}Review
+                    {% elif request.url.path == '/subscriptions' %}Subscriptions
+                    {% elif request.url.path == '/upload' %}Import
+                    {% elif request.url.path == '/settings' %}Settings
+                    {% else %}Workspace{% endif %}
+                </span>
+            </div>
+            <div class="app-topbar-actions">
+                <span class="local-status"><span class="local-status-dot"></span>Private on this device</span>
+                <a href="/upload" class="btn btn-primary topbar-import">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4" /></svg>
+                    Import statement
+                </a>
+            </div>
+        </header>
         <div class="main-inner">
             {% block content %}{% endblock %}
         </div>
@@ -256,9 +286,19 @@
         function showToast(message, type = 'success') {
             const container = document.getElementById('toastContainer');
             const toast = document.createElement('div');
-            const icons = { success: '✓', error: '✗', info: 'ℹ' };
+            const icons = {
+                success: '<svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>',
+                error: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6m0-6-6 6"/></svg>',
+                info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg>',
+            };
             toast.className = `toast toast-${type}`;
-            toast.innerHTML = `<span>${icons[type] || ''}</span> ${message}`;
+            const icon = document.createElement('span');
+            icon.className = 'toast-icon';
+            icon.setAttribute('aria-hidden', 'true');
+            icon.innerHTML = icons[type] || '';
+            const label = document.createElement('span');
+            label.textContent = String(message ?? '');
+            toast.append(icon, label);
             container.appendChild(toast);
             setTimeout(() => {
                 toast.style.opacity = '0';
@@ -274,7 +314,11 @@
         }
 
         function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
+            const sidebar = document.getElementById('sidebar');
+            const toggle = document.getElementById('menuToggle');
+            const isOpen = sidebar.classList.toggle('open');
+            toggle.setAttribute('aria-expanded', String(isOpen));
+            toggle.setAttribute('aria-label', isOpen ? 'Close navigation' : 'Open navigation');
         }
 
         // Close sidebar on outside click (mobile)
@@ -284,6 +328,8 @@
             if (window.innerWidth <= 768 && sidebar.classList.contains('open')
                 && !sidebar.contains(e.target) && !toggle.contains(e.target)) {
                 sidebar.classList.remove('open');
+                toggle.setAttribute('aria-expanded', 'false');
+                toggle.setAttribute('aria-label', 'Open navigation');
             }
         });
     </script>

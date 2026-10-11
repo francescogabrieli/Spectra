@@ -1,13 +1,31 @@
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from spectra.config import Settings
 from spectra.web.server import app
+from spectra.web import server
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch, tmp_path: Path, mock_db):
+    settings = Settings(
+        service_role="gateway",
+        ai_provider="local",
+        base_currency="EUR",
+        db_path=tmp_path / "synthetic-finance" / "spectra.db",
+        import_db_path=tmp_path / "staging.sqlite",
+        fx_db_path=tmp_path / "rates.sqlite",
+    )
+    mock_db.get_app_setting.side_effect = lambda key, default=None: (
+        "EUR" if key == "base_currency" else default
+    )
+    mock_db.read_model.return_value = {"transaction_count": 0}
+    mock_db.list_known_categories.return_value = ["Food", "Rent"]
+    monkeypatch.setattr(server, "load_settings", lambda: settings)
+    monkeypatch.setattr(server, "LedgerClient", lambda _settings=None: mock_db)
     return TestClient(app)
 
 @pytest.fixture
@@ -56,7 +74,7 @@ def test_trends_page(client):
 @patch("spectra.web.server._get_db")
 def test_api_categories(mock_get_db_fn, client, mock_db):
     mock_get_db_fn.return_value = mock_db
-    mock_db._conn.execute.return_value.fetchall.return_value = [("Food",), ("Rent",)]
+    mock_db.list_known_categories.return_value = ["Food", "Rent"]
     
     response = client.get("/api/categories")
     assert response.status_code == 200

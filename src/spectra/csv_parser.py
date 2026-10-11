@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
-from typing import Any
+from spectra.money import decimal_text
 
 logger = logging.getLogger("spectra.csv_parser")
 
@@ -65,6 +65,10 @@ _DEBIT_ALIASES = {
 _CURRENCY_ALIASES = {
     "valuta", "currency", "divisa", "moneta"
 }
+_ACCOUNT_ALIASES = {
+    "account", "account name", "account id", "account number", "source account",
+    "conto", "conto corrente", "nome conto", "numero conto", "iban",
+}
 
 _FIELD_ALIASES = {
     "date": _DATE_ALIASES,
@@ -76,6 +80,7 @@ _FIELD_ALIASES = {
     "credit": _CREDIT_ALIASES,
     "debit": _DEBIT_ALIASES,
     "currency": _CURRENCY_ALIASES,
+    "account": _ACCOUNT_ALIASES,
 }
 _NUMERIC_DATE_RE = re.compile(
     r"^\s*(?P<a>\d{1,4})[\/\-.](?P<b>\d{1,2})[\/\-.](?P<c>\d{1,4})\s*$"
@@ -90,11 +95,17 @@ class ParsedTransaction:
     amount: float   # negative = expense, positive = income
     currency: str
     raw_description: str
+    amount_decimal: str = ""
     statement_category: str = ""
     original_amount: float | None = None
     original_currency: str | None = None
     counterpart: str = ""
     account_name: str = ""
+    account_id: str = ""
+    legacy_id: str = ""
+    legacy_account_name: str = ""
+    account_balance: float | None = None
+    account_balance_date: str = ""
 
 
 def _normalize(s: str) -> str:
@@ -242,10 +253,37 @@ def _parse_date(raw: str, prefer_day_first: bool = True) -> str:
     raise ValueError(f"Cannot parse date: {raw!r}")
 
 
-def _make_id(date: str, description: str, amount: float) -> str:
-    """Create a stable ID for dedup (hash of key fields)."""
+def _make_id(
+    date: str,
+    description: str,
+    amount: float,
+    *,
+    account_name: str = "",
+    currency: str = "EUR",
+    occurrence: int = 0,
+) -> str:
+    """Build a stable account/currency scoped identity for a statement row.
+
+    The first unscoped row keeps the historical ID format for compatibility.
+    A per-fingerprint occurrence number distinguishes repeated identical
+    postings within one statement and remains stable when that statement is
+    re-imported in the same order.
+    """
     import hashlib
-    key = f"{date}|{description.strip().lower()}|{amount:.2f}"
+
+    legacy_key = f"{date}|{description.strip().lower()}|{amount:.2f}"
+    account_scope = re.sub(r"\s+", " ", str(account_name or "").strip().casefold())
+    currency_code = str(currency or "EUR").strip().upper()
+    key = legacy_key
+    if account_scope:
+        key += f"|account={account_scope}"
+    if currency_code and currency_code != "EUR":
+        from spectra.money import decimal_text
+        key = f"{date}|{description.strip().lower()}|{decimal_text(amount, currency_code)}|currency={currency_code}"
+        if account_scope:
+            key += f"|account={account_scope}"
+    if occurrence:
+        key += f"|occurrence={occurrence}"
     return "CSV-" + hashlib.sha1(key.encode()).hexdigest()[:16]
 
 def _map_columns(headers: list[str]) -> dict[str, int]:
@@ -324,6 +362,15 @@ def _resolve_row_currency(row: list[str], col: dict[str, int], default_currency:
         if value:
             return value
     return default_currency
+
+
+def _safe_account_label(value: str) -> str:
+    """Avoid persisting raw account numbers while keeping a useful label."""
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    compact = re.sub(r"\s+", "", cleaned)
+    if re.fullmatch(r"[A-Z]{2}\d{13,32}", compact, re.IGNORECASE) or re.fullmatch(r"\d{8,}", compact):
+        return f"Account ••••{compact[-4:]}"
+    return cleaned
 
 
 def _clean_description(text: str) -> str:
@@ -478,7 +525,7 @@ def parse_csv(
         raw = path.read_text(encoding="latin-1")
 
     delimiter = _detect_delimiter(raw[:2000])
-    logger.info("Detected delimiter: %r for file: %s", delimiter, path.name)
+    logger.info("Detected CSV delimiter: %r", delimiter)
 
     reader = csv.reader(io.StringIO(raw), delimiter=delimiter)
     rows = list(reader)
@@ -515,6 +562,8 @@ def parse_csv(
         ]
     )
 
+    occurrences: dict[tuple[str, str, float, str, str], int] = {}
+    import hashlib
     for row_num, row in enumerate(data_rows, start=header_idx + 2):
         # Skip empty rows
         if not any(c.strip() for c in row):
@@ -552,9 +601,38 @@ def parse_csv(
 
             amount = _parse_row_amount(row, col)
 
-            tx_id = _make_id(date, description, amount)
-
             row_currency = _resolve_row_currency(row, col, currency)
+            account_identity = (
+                row[col["account"]].strip()
+                if "account" in col and col["account"] < len(row)
+                else ""
+            )
+            account_id = (
+                "acct-" + hashlib.sha256(
+                    f"{account_identity.casefold()}|{row_currency.upper()}".encode("utf-8")
+                ).hexdigest()[:20]
+                if account_identity
+                else ""
+            )
+            account_name = _safe_account_label(account_identity)
+            fingerprint = (
+                date,
+                description.strip().casefold(),
+                round(float(amount), 2),
+                account_identity.casefold(),
+                row_currency.upper(),
+            )
+            occurrence = occurrences.get(fingerprint, 0)
+            occurrences[fingerprint] = occurrence + 1
+            tx_id = _make_id(
+                date,
+                description,
+                amount,
+                account_name=account_identity,
+                currency=row_currency,
+                occurrence=occurrence,
+            )
+            legacy_id = _make_id(date, description, amount)
 
             statement_category = ""
             if "category" in col and col["category"] < len(row):
@@ -567,16 +645,21 @@ def parse_csv(
                     amount=amount,
                     currency=row_currency,
                     raw_description=description,
+                    amount_decimal=decimal_text(amount, row_currency),
                     statement_category=statement_category,
                     counterpart=counterpart,
+                    account_name=account_name,
+                    account_id=account_id,
+                    legacy_id=legacy_id if account_name or row_currency.upper() != "EUR" else "",
+                    legacy_account_name="",
                 )
             )
-        except (ValueError, IndexError) as e:
-            logger.warning("Skipping row %d: %s — %s", row_num, row, e)
+        except (ValueError, IndexError):
+            logger.warning("Skipping malformed CSV row %d", row_num)
             skipped += 1
 
     logger.info(
-        "Parsed %d transactions (%d skipped) from %s",
-        len(transactions), skipped, path.name,
+        "Parsed %d transactions (%d skipped)",
+        len(transactions), skipped,
     )
     return transactions

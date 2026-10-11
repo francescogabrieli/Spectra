@@ -76,7 +76,7 @@
         <div class="settings-row">
             <div class="settings-label">
                 Base Currency
-                <small>Required before import. All amounts are normalized to this currency using ECB rates.</small>
+                    <small>New transactions are converted when a verified rate is available. Each saved amount keeps its own currency; changing this preference never relabels history. Other-currency amounts stay visible and are excluded from base-currency totals. Historic amounts with unsupported precision require an explicit correction.</small>
             </div>
             <div class="settings-control-group">
                 <select class="settings-select" id="baseCurrencySelect">
@@ -95,6 +95,12 @@
                 <span class="settings-badge" id="currencySetupBadge" style="display:none;">Required</span>
             </div>
         </div>
+    </div>
+
+    <div class="settings-group" id="legacyCurrencyReview" style="display:none;">
+        <h3>Confirm historical currencies</h3>
+        <p class="settings-group-copy">Older records did not store their amount currency. They remain visible in Transactions and exports, but are excluded from base-currency totals until you confirm each denomination here.</p>
+        <div id="legacyCurrencyRows" class="rules-list"></div>
     </div>
 
     <div class="settings-group" id="settings-appearance">
@@ -885,18 +891,20 @@
         `).join('');
 
         container.innerHTML = `
-            <table>
-                <thead>
-                    <tr>
-                        <th>When</th>
-                        <th>Merchant</th>
-                        <th>Category</th>
-                        <th>Source</th>
-                        <th>Scope</th>
-                    </tr>
-                </thead>
-                <tbody>${rows}</tbody>
-            </table>
+            <div class="table-container learning-table-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>When</th>
+                            <th>Merchant</th>
+                            <th>Category</th>
+                            <th>Source</th>
+                            <th>Scope</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
         `;
     }
 
@@ -997,9 +1005,72 @@
             document.getElementById('merchantCount').textContent = s.merchant_count.toLocaleString();
             document.getElementById('categoryCount').textContent = s.category_count.toLocaleString();
             document.getElementById('activeRuleCount').textContent = (s.active_rule_count || 0).toLocaleString();
+            await loadLegacyCurrencyReview();
         } catch (err) {
             console.error('Settings load error:', err);
         }
+    }
+
+    async function loadLegacyCurrencyReview() {
+        const group = document.getElementById('legacyCurrencyReview');
+        const container = document.getElementById('legacyCurrencyRows');
+        if (!group || !container) return;
+        const res = await fetch('/api/settings/legacy-currency?per_page=200');
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        group.style.display = items.length ? '' : 'none';
+        container.innerHTML = items.map(item => `
+            <div class="settings-row legacy-currency-row">
+                <div class="settings-label">
+                    <strong>${escapeHtml(item.date)} · ${escapeHtml(item.merchant)}</strong>
+                    <small>${escapeHtml(String(item.amount))} · ${escapeHtml(item.account_name || 'Account unknown')} · ID ${escapeHtml(item.id.slice(0, 10))}</small>
+                </div>
+                <div class="settings-control-group">
+                    <input class="settings-input legacy-currency-code" data-id="${escapeHtml(item.id)}" maxlength="3" placeholder="EUR" aria-label="Currency for ${escapeHtml(item.merchant)}">
+                    <input class="settings-input legacy-amount-override" data-id="${escapeHtml(item.id)}" inputmode="decimal" placeholder="Amount correction (optional)" aria-label="Exact amount correction for ${escapeHtml(item.merchant)}">
+                    <button class="btn btn-secondary btn-sm legacy-currency-save" data-id="${escapeHtml(item.id)}" type="button">Confirm currency</button>
+                </div>
+            </div>
+        `).join('');
+        container.querySelectorAll('.legacy-currency-save').forEach(button => {
+            button.addEventListener('click', async () => {
+                const id = button.dataset.id || '';
+                const input = Array.from(container.querySelectorAll('.legacy-currency-code'))
+                    .find(element => element.dataset.id === id);
+                const amountInput = Array.from(container.querySelectorAll('.legacy-amount-override'))
+                    .find(element => element.dataset.id === id);
+                const currency = String(input?.value || '').trim().toUpperCase();
+                if (!/^[A-Z]{3}$/.test(currency)) {
+                    showToast('Enter a 3-letter currency code, such as EUR or USD.', 'error');
+                    return;
+                }
+                button.disabled = true;
+                try {
+                    const response = await fetch('/api/settings/legacy-currency', {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ items: [{
+                            id,
+                            currency,
+                            ...(String(amountInput?.value || '').trim()
+                                ? { amount_decimal: String(amountInput.value).trim().replace(',', '.') }
+                                : {}),
+                        }] }),
+                    });
+                    const result = await response.json();
+                    if (!response.ok || !result.ok) {
+                        showToast(result.error || 'Could not confirm currency.', 'error');
+                        button.disabled = false;
+                        return;
+                    }
+                    showToast(`Saved ${currency} for this historical transaction.`);
+                    await loadLegacyCurrencyReview();
+                } catch (err) {
+                    showToast('Could not confirm currency.', 'error');
+                    button.disabled = false;
+                }
+            });
+        });
     }
 
     async function exportCSV() {

@@ -11,7 +11,11 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+import hashlib
+import json
+import threading
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
@@ -56,6 +60,12 @@ _SOURCE_PRIORITIES = {
     "merchant_memory": 2,
     "user_override": 3,
 }
+
+_CLASSIFIER_CACHE: OrderedDict[str, Any | None] = OrderedDict()
+_CLASSIFIER_CACHE_LOCK = threading.RLock()
+_CLASSIFIER_CACHE_MAX_SIZE = 4
+_CLASSIFIER_CACHE_HITS = 0
+_CLASSIFIER_CACHE_MISSES = 0
 
 # ── Seed knowledge ──────────────────────────────────────────────
 # Each tuple is (description_example, category).  These bootstrap the model
@@ -408,6 +418,46 @@ def _select_clean_name_text(rows: list[dict[str, str]]) -> list[str]:
 
 
 def train_classifier(
+    training_data: list[dict[str, str]] | list[tuple[str, str]] | None = None,
+) -> Any | None:
+    """Reuse a classifier while its correction and history data is unchanged."""
+    global _CLASSIFIER_CACHE_HITS, _CLASSIFIER_CACHE_MISSES
+    payload = json.dumps(training_data or [], ensure_ascii=False, sort_keys=True, default=str)
+    cache_key = hashlib.sha256(("classifier-v2:" + payload).encode("utf-8")).hexdigest()
+    with _CLASSIFIER_CACHE_LOCK:
+        if cache_key in _CLASSIFIER_CACHE:
+            _CLASSIFIER_CACHE_HITS += 1
+            _CLASSIFIER_CACHE.move_to_end(cache_key)
+            return _CLASSIFIER_CACHE[cache_key]
+        _CLASSIFIER_CACHE_MISSES += 1
+        # Keep the miss path inside the lock so two concurrent imports with
+        # identical feedback cannot both pay the full training cost.
+        classifier = _train_classifier_uncached(training_data)
+        _CLASSIFIER_CACHE[cache_key] = classifier
+        _CLASSIFIER_CACHE.move_to_end(cache_key)
+        while len(_CLASSIFIER_CACHE) > _CLASSIFIER_CACHE_MAX_SIZE:
+            _CLASSIFIER_CACHE.popitem(last=False)
+        return classifier
+
+
+def classifier_cache_info() -> dict[str, int]:
+    with _CLASSIFIER_CACHE_LOCK:
+        return {
+            "size": len(_CLASSIFIER_CACHE),
+            "hits": _CLASSIFIER_CACHE_HITS,
+            "misses": _CLASSIFIER_CACHE_MISSES,
+        }
+
+
+def clear_classifier_cache() -> None:
+    global _CLASSIFIER_CACHE_HITS, _CLASSIFIER_CACHE_MISSES
+    with _CLASSIFIER_CACHE_LOCK:
+        _CLASSIFIER_CACHE.clear()
+        _CLASSIFIER_CACHE_HITS = 0
+        _CLASSIFIER_CACHE_MISSES = 0
+
+
+def _train_classifier_uncached(
     training_data: list[dict[str, str]] | list[tuple[str, str]] | None = None,
 ) -> Any | None:
     """Train a weighted TF-IDF + LogisticRegression local classifier."""

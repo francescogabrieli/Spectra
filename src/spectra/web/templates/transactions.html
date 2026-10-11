@@ -76,7 +76,7 @@
 
     <div id="tableBody">
         <div class="empty-state">
-            <div class="icon">📋</div>
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h4"/></svg></div>
             <h3>Loading...</h3>
         </div>
     </div>
@@ -257,7 +257,7 @@
             const hasFilters = activeFilterCount(filters) > 0 || filters.uncategorizedOnly;
             container.innerHTML = `
             <div class="empty-state">
-                <div class="icon">📋</div>
+                <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h4"/></svg></div>
                 <h3>${hasFilters ? 'No matching transactions' : 'No transactions found'}</h3>
                 <p>${hasFilters ? 'Try clearing filters or turning off inbox zero mode.' : 'Upload transactions to get started.'}</p>
                 ${hasFilters
@@ -269,7 +269,7 @@
 
         let html = `<table>
         <thead><tr>
-            <th style="width:40px">✓</th>
+            <th style="width:40px"><span class="sr-only">Select</span></th>
             <th>Date</th>
             <th>Merchant</th>
             <th>Category</th>
@@ -294,6 +294,9 @@
             }
             if (t.account_name) {
                 extraBadges.push(`<span class="settings-badge tx-meta-badge">${escapeHtml(t.account_name)}</span>`);
+            }
+            if (!t.currency) {
+                extraBadges.push(`<span class="settings-badge warning tx-meta-badge">Currency unknown</span>`);
             }
             const checkbox = isUncategorized
                 ? `<input type="checkbox" class="uncategorized-check" value="${t.id}" aria-label="Select transaction">`
@@ -321,7 +324,9 @@
                 </span>
                 ${quickCategorySelect}
             </td>
-            <td class="amount ${amountClass}" style="text-align:right">${formatCurrency(t.amount)}</td>
+            <td class="amount ${amountClass}" style="text-align:right">${t.currency
+                ? formatCurrency(t.amount, t.currency)
+                : `${escapeHtml(t.amount_decimal ?? String(t.amount))} · unknown currency`}</td>
         </tr>`;
         }
 

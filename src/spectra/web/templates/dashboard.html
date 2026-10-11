@@ -65,11 +65,11 @@
 <div class="charts-row">
     <div class="chart-box">
         <h3>Spending by Category</h3>
-        <canvas id="categoryChart" height="260"></canvas>
+        <div id="categoryChart" class="category-chart" aria-label="Spending by category"></div>
     </div>
     <div class="chart-box">
         <h3>Monthly Trend</h3>
-        <canvas id="monthlyChart" height="260"></canvas>
+        <div id="monthlyChart" class="monthly-chart" aria-label="Monthly spending trend"></div>
     </div>
 </div>
 
@@ -87,7 +87,6 @@
 
 {% block scripts %}
 <script>
-    let catChart, monthChart;
     let dashboardData = null;
     const DASHBOARD_SCOPE_STORAGE_KEY = 'spectra-summary-scope';
     const VALID_SUMMARY_SCOPES = ['cycle', '90d', 'ytd'];
@@ -139,162 +138,79 @@
         return value || fallback;
     }
 
-    function getChartTheme() {
-        return {
-            fontFamily: cssVar('--font', 'Inter, sans-serif'),
-            textColor: cssVar('--text', '#111827'),
-            mutedColor: cssVar('--text-muted', '#6B7280'),
-            gridColor: cssVar('--chart-grid', '#F1F5F9'),
-            accent: cssVar('--accent', '#4F46E5'),
-            palette: [
-                cssVar('--accent', '#4F46E5'),       // indigo
-                cssVar('--positive', '#059669'),      // emerald
-                cssVar('--warning', '#D97706'),       // amber
-                cssVar('--negative', '#DC2626'),      // red
-                cssVar('--purple', '#7C3AED'),        // violet
-                '#0EA5E9',  // sky blue
-                '#DB2777',  // pink
-                '#EA580C',  // orange
-                '#65A30D',  // lime
-                '#0891B2',  // cyan
-                '#9333EA',  // purple
-                '#B45309',  // yellow-brown
-                '#BE123C',  // rose
-                '#4B5563',  // slate
-            ],
-        };
+    function escapeChartText(value) {
+        return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
     }
 
     function renderCharts(data) {
-        const theme = getChartTheme();
+        const palette = [
+            cssVar('--accent', '#4F46E5'), cssVar('--positive', '#059669'),
+            cssVar('--warning', '#D97706'), cssVar('--negative', '#DC2626'),
+            cssVar('--purple', '#7C3AED'), '#0EA5E9', '#DB2777', '#EA580C',
+            '#65A30D', '#0891B2', '#9333EA', '#B45309', '#BE123C', '#4B5563',
+        ];
+        const categories = Object.entries(data.by_category || {}).filter(([, value]) => Number(value) > 0);
+        const total = categories.reduce((sum, [, value]) => sum + Number(value), 0);
+        const categoryChart = document.getElementById('categoryChart');
+        if (!categories.length || total <= 0) {
+            categoryChart.innerHTML = '<p class="chart-empty">No base-currency spending in this period.</p>';
+        } else {
+            let offset = 0;
+            const stops = categories.map(([, value], index) => {
+                const start = offset;
+                offset += Number(value) / total * 100;
+                return `${palette[index % palette.length]} ${start.toFixed(2)}% ${offset.toFixed(2)}%`;
+            });
+            categoryChart.innerHTML = `
+                <div class="category-chart-layout">
+                    <div class="category-chart-ring" role="img" aria-label="${categories.length} spending categories, total ${escapeChartText(formatCurrency(total))}" style="background:conic-gradient(${stops.join(',')})">
+                        <div class="category-chart-center"><strong>${escapeChartText(formatCurrency(total))}</strong><span>Total</span></div>
+                    </div>
+                    <ul class="category-chart-legend">${categories.map(([label, value], index) => `
+                        <li><span class="category-chart-dot" style="background:${palette[index % palette.length]}"></span>
+                            <span class="category-chart-name">${escapeChartText(label)}</span>
+                            <span class="category-chart-value">${escapeChartText(formatCurrency(value))}</span></li>
+                    `).join('')}</ul>
+                </div>`;
+        }
 
-        const catLabels = Object.keys(data.by_category);
-        const catValues = Object.values(data.by_category);
-
-        if (catChart) catChart.destroy();
-        catChart = new Chart(document.getElementById('categoryChart'), {
-            type: 'doughnut',
-            data: {
-                labels: catLabels,
-                datasets: [{
-                    data: catValues,
-                    backgroundColor: theme.palette.slice(0, catLabels.length),
-                    borderWidth: 2,
-                    borderColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim() || '#fff',
-                    hoverOffset: 8,
-                    hoverBorderWidth: 0,
-                    spacing: 2,
-                }],
-            },
-            options: {
-                responsive: true,
-                animation: { duration: 600, easing: 'easeOutQuart' },
-                plugins: {
-                    legend: {
-                        position: 'right',
-                        labels: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 12, weight: '500' },
-                            padding: 14,
-                            usePointStyle: true,
-                            pointStyleWidth: 8,
-                        },
-                    },
-                    tooltip: {
-                        backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim(),
-                        titleColor: theme.textColor,
-                        bodyColor: theme.mutedColor,
-                        borderColor: getComputedStyle(document.documentElement).getPropertyValue('--border').trim(),
-                        borderWidth: 1,
-                        padding: 12,
-                        cornerRadius: 8,
-                        callbacks: {
-                            label: ctx => {
-                                const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
-                                const pct = total > 0 ? Math.round(ctx.parsed / total * 100) : 0;
-                                return ` ${formatCurrency(ctx.parsed)} (${pct}%)`;
-                            },
-                        },
-                    },
-                },
-                cutout: '70%',
-            },
-        });
-
-        const periodKeys = Object.keys(data.monthly);
-        const monthLabels = periodKeys.map(startDate => {
-            if (data.scope === 'cycle') {
-                return formatSpectraDate(startDate, { day: 'numeric', month: 'short' });
-            }
-            return formatSpectraDate(startDate, { month: 'short', year: '2-digit' });
-        });
-        const monthValues = Object.values(data.monthly);
-
-        if (monthChart) monthChart.destroy();
-        monthChart = new Chart(document.getElementById('monthlyChart'), {
-            type: 'bar',
-            data: {
-                labels: monthLabels,
-                datasets: [{
-                    label: 'Spending',
-                    data: monthValues,
-                    backgroundColor: theme.palette.map(c => c + 'CC'),
-                    backgroundColor: theme.accent + 'CC',
-                    hoverBackgroundColor: theme.accent,
-                    borderRadius: 8,
-                    borderSkipped: false,
-                    borderWidth: 0,
-                }],
-            },
-            options: {
-                responsive: true,
-                animation: { duration: 500, easing: 'easeOutCubic' },
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim(),
-                        titleColor: theme.textColor,
-                        bodyColor: theme.mutedColor,
-                        borderColor: getComputedStyle(document.documentElement).getPropertyValue('--border').trim(),
-                        borderWidth: 1,
-                        padding: 12,
-                        cornerRadius: 8,
-                        callbacks: {
-                            title: context => {
-                                const key = periodKeys[context[0].dataIndex];
-                                const range = data.monthly_ranges?.[key];
-                                if (!range) {
-                                    return monthLabels[context[0].dataIndex];
-                                }
-                                return formatCycleRange(range.start, range.end, { day: 'numeric', month: 'short', year: 'numeric' });
-                            },
-                            label: ctx => ` ${formatCurrency(ctx.parsed.y)}`,
-                        },
-                    },
-                },
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 11, weight: '500' },
-                            callback: v => formatCurrency(v),
-                        },
-                        grid: { color: theme.gridColor, lineWidth: 1 },
-                        border: { display: false },
-                    },
-                    x: {
-                        ticks: {
-                            color: theme.mutedColor,
-                            font: { family: theme.fontFamily, size: 11 },
-                            maxRotation: 0,
-                        },
-                        grid: { display: false },
-                        border: { display: false },
-                    },
-                },
-            },
-        });
+        const periodKeys = Object.keys(data.monthly || {});
+        const labels = periodKeys.map(startDate => data.scope === 'cycle'
+            ? formatSpectraDate(startDate, { day: 'numeric', month: 'short' })
+            : formatSpectraDate(startDate, { month: 'short', year: '2-digit' }));
+        const values = periodKeys.map(key => Number(data.monthly[key] || 0));
+        const monthlyChart = document.getElementById('monthlyChart');
+        if (!values.length) {
+            monthlyChart.innerHTML = '<p class="chart-empty">No base-currency spending in this period.</p>';
+            return;
+        }
+        const width = 700, height = 260, left = 58, right = 14, top = 12, bottom = 42;
+        const plotWidth = width - left - right, plotHeight = height - top - bottom;
+        const maxValue = Math.max(...values, 1);
+        const accent = cssVar('--accent', '#4F46E5');
+        const muted = cssVar('--text-muted', '#6B7280');
+        const grid = cssVar('--chart-grid', '#F1F5F9');
+        const gridLines = Array.from({ length: 4 }, (_, index) => {
+            const ratio = index / 3;
+            const y = top + plotHeight * ratio;
+            const value = maxValue * (1 - ratio);
+            return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="${grid}"/>
+                <text x="${left - 8}" y="${y + 4}" text-anchor="end" fill="${muted}" font-size="10">${escapeChartText(formatCurrency(value))}</text>`;
+        }).join('');
+        const band = plotWidth / values.length;
+        const barWidth = Math.min(52, Math.max(8, band * 0.58));
+        const bars = values.map((value, index) => {
+            const barHeight = value > 0 ? Math.max(2, value / maxValue * plotHeight) : 0;
+            const x = left + band * index + (band - barWidth) / 2;
+            const y = top + plotHeight - barHeight;
+            const range = data.monthly_ranges?.[periodKeys[index]];
+            const title = range ? formatCycleRange(range.start, range.end) : labels[index];
+            return `<g><title>${escapeChartText(title)} · ${escapeChartText(formatCurrency(value))}</title>
+                <rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="5" fill="${accent}" opacity="0.86"/>
+                <text x="${x + barWidth / 2}" y="${height - 14}" text-anchor="middle" fill="${muted}" font-size="10">${escapeChartText(labels[index])}</text></g>`;
+        }).join('');
+        monthlyChart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Monthly spending in ${escapeChartText(data.base_currency || defaultCurrency)}">${gridLines}${bars}</svg>`;
     }
 
     function renderBurnRate(data) {
@@ -360,7 +276,11 @@
             document.getElementById('needsReviewCount').textContent = Number(data.needs_review_count || 0).toLocaleString();
             document.getElementById('confirmedTransfersCount').textContent = Number(data.confirmed_internal_transfers_count || 0).toLocaleString();
 
-            document.getElementById('subtitle').textContent = data.scope_label || data.current_cycle?.label || 'Selected period';
+            const periodLabel = data.scope_label || data.current_cycle?.label || 'Selected period';
+            const outsideCurrencyCount = Number(data.non_base_currency_count || 0);
+            document.getElementById('subtitle').textContent = outsideCurrencyCount
+                ? `${periodLabel} · ${outsideCurrencyCount} transaction(s) in another or unknown currency are excluded from ${data.base_currency || defaultCurrency} totals.`
+                : periodLabel;
             renderBurnRate(data);
             renderInsights(data);
 
@@ -369,10 +289,10 @@
                 if (!document.getElementById('dashboardEmptyState')) {
                     document.getElementById('cards').insertAdjacentHTML('afterend',
                         `<div class="empty-state" id="dashboardEmptyState" style="margin:-16px 0 24px;">
-                            <div class="icon">📊</div>
+                            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 15v-3m4 3V8m4 7v-5"/></svg></div>
                             <h3>Your dashboard is empty</h3>
                             <p>Upload a bank export to see your spending breakdown</p>
-                            <a href="/upload" class="btn btn-primary" style="margin-top:16px;">📤 Upload Transactions</a>
+                            <a href="/upload" class="btn btn-primary" style="margin-top:16px;">Upload Transactions</a>
                         </div>`);
                 }
             }

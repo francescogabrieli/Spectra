@@ -3,18 +3,41 @@
 from __future__ import annotations
 
 import logging
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from spectra.money import as_decimal, quantize_money
 
 logger = logging.getLogger("spectra.budget")
 
 _BUDGET_SHEET = "Budget"
-_HEADER = ["Category", "Monthly Budget (€)"]
+_HEADER_PREFIX = "Monthly Budget"
 
 
 # ── Read ──────────────────────────────────────────────────────────
 
-def read_budgets(sheets_client: Any) -> dict[str, float]:
-    """Read the Budget tab and return {category: budget_amount}."""
+def _budget_currency(header: list[str]) -> str | None:
+    """Infer the currency explicitly written in a budget column heading."""
+    if len(header) < 2:
+        return None
+    match = re.search(r"\(([^()]+)\)", header[1])
+    if not match:
+        return None
+    marker = match.group(1).strip().upper()
+    # Existing releases named the EUR column with a symbol. Treat that
+    # historical label as EUR, never as the current preference by default.
+    if marker in {"€", "EUR"}:
+        return "EUR"
+    if marker in {"$", "USD"}:
+        return "USD"
+    if marker in {"£", "GBP"}:
+        return "GBP"
+    return marker if re.fullmatch(r"[A-Z]{3}", marker) else None
+
+
+def read_budgets(sheets_client: Any, currency: str = "EUR") -> dict[str, Decimal]:
+    """Read budgets only when their column explicitly matches *currency*."""
     try:
         ws = sheets_client._spreadsheet.worksheet(_BUDGET_SHEET)
     except Exception:
@@ -24,14 +47,20 @@ def read_budgets(sheets_client: Any) -> dict[str, float]:
     if len(rows) < 2:
         return {}
 
-    budgets: dict[str, float] = {}
+    sheet_currency = _budget_currency(rows[0])
+    if sheet_currency != str(currency).upper():
+        logger.info("Ignoring budget column in %s; it is %s, requested %s", _BUDGET_SHEET,
+                    sheet_currency or "unknown currency", str(currency).upper())
+        return {}
+
+    budgets: dict[str, Decimal] = {}
     for row in rows[1:]:
         if len(row) < 2 or not row[0].strip():
             continue
         try:
-            amount = float(row[1].replace(",", ".").strip() or "0")
+            amount = as_decimal(row[1].replace(",", ".").strip() or "0")
             budgets[row[0].strip()] = amount
-        except ValueError:
+        except (ValueError, InvalidOperation):
             pass
 
     return budgets
@@ -39,7 +68,7 @@ def read_budgets(sheets_client: Any) -> dict[str, float]:
 
 # ── Write / sync ──────────────────────────────────────────────────
 
-def sync_budget_sheet(sheets_client: Any, categories: list[str]) -> None:
+def sync_budget_sheet(sheets_client: Any, categories: list[str], currency: str = "EUR") -> None:
     """Create the Budget tab if missing, and add any new categories with 0 budget.
 
     The user fills in the actual numbers — Spectra never overwrites existing values.
@@ -60,7 +89,7 @@ def sync_budget_sheet(sheets_client: Any, categories: list[str]) -> None:
 
     # Write header if missing
     if not existing_rows:
-        ws.update("A1", [_HEADER])
+        ws.update("A1", [["Category", f"{_HEADER_PREFIX} ({str(currency).upper()})"]])
         _apply_budget_header_formatting(sheets_client, ws.id)
 
     # Append any new categories (budget = 0, user fills them in)
@@ -119,8 +148,9 @@ def _apply_budget_header_formatting(sheets_client: Any, sheet_id: int) -> None:
 # ── Compute status ────────────────────────────────────────────────
 
 def compute_budget_status(
-    cat_totals: dict[str, float],
-    budgets: dict[str, float],
+    cat_totals: dict[str, float | Decimal],
+    budgets: dict[str, float | Decimal],
+    currency: str = "EUR",
 ) -> list[dict[str, Any]]:
     """Compute budget status for all tracked categories.
 
@@ -131,10 +161,14 @@ def compute_budget_status(
     results: list[dict[str, Any]] = []
 
     for cat, budget in sorted(budgets.items()):
-        if budget <= 0:
+        try:
+            exact_budget = quantize_money(budget, currency)
+            exact_spent = quantize_money(cat_totals.get(cat, 0), currency)
+        except ValueError:
             continue
-        spent = round(cat_totals.get(cat, 0.0), 2)
-        pct = round(spent / budget * 100, 1)
+        if exact_budget <= 0:
+            continue
+        pct = round(float(exact_spent / exact_budget * Decimal(100)), 1)
 
         if pct >= 100:
             status = "🔴 Over budget"
@@ -145,8 +179,10 @@ def compute_budget_status(
 
         results.append({
             "category": cat,
-            "spent": spent,
-            "budget": budget,
+            # Google Sheets is a floating-point external adapter. Core
+            # SQLite/dashboard calculations keep Decimal values until here.
+            "spent": float(exact_spent),
+            "budget": float(exact_budget),
             "pct": pct,
             "status": status,
         })

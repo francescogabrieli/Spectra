@@ -2,8 +2,12 @@
 {% block title %}Budget — Spectra{% endblock %}
 
 {% block content %}
-<h1 class="page-title">Budget</h1>
-<p class="page-subtitle" id="budgetSubtitle">Monthly spending limits</p>
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Budget</h1>
+        <p class="page-subtitle" id="budgetSubtitle">Monthly spending limits</p>
+    </div>
+</div>
 
 <!-- Summary bar -->
 <div class="cards" id="budgetSummary">
@@ -21,10 +25,12 @@
     </div>
 </div>
 
+<div class="insight-card insight-warning" id="budgetCurrencyNotice" style="display:none;"></div>
+
 <!-- Budget cards grid -->
 <div class="budget-grid" id="budgetGrid">
     <div class="empty-state">
-        <div class="icon">⏳</div>
+        <div class="icon" aria-hidden="true"><span class="loading-indicator"></span></div>
         <h3>Loading...</h3>
     </div>
 </div>
@@ -38,6 +44,14 @@
         const data = await res.json();
 
         document.getElementById('budgetSubtitle').textContent = data.current_cycle?.label || 'Current financial cycle';
+        const currencyNotice = document.getElementById('budgetCurrencyNotice');
+        const excludedCount = (data.non_base_currency_count || 0) + (data.non_base_budget_count || 0);
+        if (excludedCount > 0) {
+            currencyNotice.textContent = `${data.non_base_currency_count || 0} transaction(s) and ${data.non_base_budget_count || 0} budget limit(s) in another or unknown currency are excluded from ${data.base_currency} totals.`;
+            currencyNotice.style.display = '';
+        } else {
+            currencyNotice.style.display = 'none';
+        }
 
         // Summary cards
         document.getElementById('statOnTrack').textContent = data.summary.on_track;
@@ -48,17 +62,18 @@
 
         if (!data.items.length) {
             grid.innerHTML = `<div class="empty-state">
-                <div class="icon">💰</div>
+                <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M7 9h.01M17 15h.01"/></svg></div>
                 <h3>No spending data yet</h3>
                 <p>Upload a CSV to see your categories here</p>
-                <a href="/upload" class="btn btn-primary" style="margin-top:16px;">📤 Upload Transactions</a>
+                <a href="/upload" class="btn btn-primary" style="margin-top:16px;">Upload Transactions</a>
             </div>`;
             return;
         }
 
         grid.innerHTML = data.items.map((item, i) => {
-            const statusIcons = { green: '🟢', yellow: '🟡', red: '🔴', none: '⚪' };
-            const icon = statusIcons[item.status];
+            const statusLabels = { green: 'On track', yellow: 'Near limit', red: 'Over limit', none: 'No limit' };
+            const statusLabel = statusLabels[item.status] || 'No limit';
+            const hasLimit = item.limit !== null && item.limit !== undefined;
             const pctDisplay = item.pct !== null ? `${item.pct}%` : '—';
             const barPct = item.pct !== null ? Math.min(item.pct, 100) : 0;
 
@@ -66,16 +81,16 @@
             <div class="budget-card" style="animation-delay: ${i * 0.05}s">
                 <div class="budget-card-header">
                     <span class="budget-category">${item.category}</span>
-                    <span class="budget-status-icon">${icon}</span>
+                    <span class="budget-status-label status-${item.status}"><span class="budget-status-dot" aria-hidden="true"></span>${statusLabel}</span>
                 </div>
                 <div class="budget-amounts">
                     <span class="budget-spent status-${item.status}">
                         ${formatCurrency(item.spent)}
                     </span>
                     <span class="budget-sep"> / </span>
-                    <span class="budget-limit-display" onclick="editLimit(this, '${item.category}', ${item.limit || ''})"
+                    <span class="budget-limit-display" onclick="editLimit(this, '${item.category}', ${hasLimit ? item.limit : ''})"
                           title="Click to set limit">
-                        ${item.limit ? formatCurrency(item.limit) : 'Set limit'}
+                        ${hasLimit ? formatCurrency(item.limit) : 'Set limit'}
                     </span>
                 </div>
                 <div class="progress-track">

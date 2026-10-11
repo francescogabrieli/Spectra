@@ -93,6 +93,15 @@ def is_ambiguous_merchant(clean_name: str, original_description: str) -> bool:
 
 def evaluate_review_state(tx: Any) -> tuple[bool, str]:
     """Return the persisted review state for a transaction-like object."""
+    conversion_error = str(_tx_get(tx, "conversion_error", "") or "").strip()
+    if conversion_error:
+        return True, "currency_conversion_failed"
+    currency_source = str(_tx_get(tx, "currency_source", "") or "")
+    if currency_source == "legacy-unknown" or not _tx_get(tx, "currency", ""):
+        return True, "legacy_currency_unknown"
+    existing_reason = str(_tx_get(tx, "review_reason", "") or "")
+    if existing_reason == "ai_response_incomplete":
+        return True, existing_reason
     transfer_status = str(_tx_get(tx, "transfer_status", TRANSFER_STATUS_NONE) or TRANSFER_STATUS_NONE)
     if transfer_status == TRANSFER_STATUS_SUGGESTED and _tx_get(tx, "transfer_group_id", ""):
         return True, REVIEW_REASON_TRANSFER_CANDIDATE
@@ -171,6 +180,10 @@ def match_internal_transfers(
         for origin, candidate in pool:
             candidate_id = str(_tx_get(candidate, "id", "") or _tx_get(candidate, "tx_id", "") or "")
             if not candidate_id or candidate_id == tx_id or candidate_id in used_ids:
+                continue
+            tx_currency = str(_tx_get(tx, "currency", "") or "").upper()
+            candidate_currency = str(_tx_get(candidate, "currency", "") or "").upper()
+            if tx_currency and candidate_currency and tx_currency != candidate_currency:
                 continue
 
             candidate_amount = float(_tx_get(candidate, "amount", 0) or 0)

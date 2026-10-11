@@ -2,8 +2,12 @@
 {% block title %}Subscriptions — Spectra{% endblock %}
 
 {% block content %}
-<h1 class="page-title">Subscriptions</h1>
-<p class="page-subtitle" id="subscriptionsSubtitle">Loading recurring charges...</p>
+<div class="page-header">
+    <div>
+        <h1 class="page-title">Subscriptions</h1>
+        <p class="page-subtitle" id="subscriptionsSubtitle">Loading recurring charges...</p>
+    </div>
+</div>
 
 <div class="cards" id="subscriptionsCards">
     <div class="card">
@@ -33,7 +37,7 @@
 <div class="table-container">
     <div id="subscriptionsTableBody">
         <div class="empty-state">
-            <div class="icon">🔁</div>
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M8 14h3m-3 3h6"/></svg></div>
             <h3>Loading...</h3>
         </div>
     </div>
@@ -98,7 +102,7 @@
         if (!items.length) {
             container.innerHTML = `
             <div class="empty-state">
-                <div class="icon">🔁</div>
+                <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M8 14h3m-3 3h6"/></svg></div>
                 <h3>No recurring subscriptions found</h3>
                 <p>Once recurring charges are detected, they will appear here.</p>
             </div>`;
@@ -161,7 +165,11 @@
             document.getElementById('subsAnnual').textContent = formatCurrency(data.summary.annual_projection);
             document.getElementById('subsCycle').textContent = formatCurrency(data.summary.in_current_cycle);
             document.getElementById('subsChanges').textContent = data.summary.price_change_count;
-            document.getElementById('subscriptionsSubtitle').textContent = data.current_cycle?.label || 'Current cycle';
+            const cycleLabel = data.current_cycle?.label || 'Current cycle';
+            const excludedCurrencyCount = Number(data.non_base_currency_count || 0);
+            document.getElementById('subscriptionsSubtitle').textContent = excludedCurrencyCount
+                ? `${cycleLabel} · ${excludedCurrencyCount} transaction(s) in another or unknown currency are excluded from ${data.base_currency} totals.`
+                : cycleLabel;
 
             const signal = document.getElementById('subscriptionSignals');
             if (data.summary.price_change_count > 0) {

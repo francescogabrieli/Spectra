@@ -1,9 +1,7 @@
 /* ─── Spectra Dashboard — Premium Finance Design System ─────────── */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-
 :root {
-    --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --text: #111827;
     --text-muted: #6B7280;
     --text-faint: #D1D5DB;
@@ -604,6 +602,130 @@ body {
     margin-bottom: 16px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+}
+
+.category-chart,
+.monthly-chart {
+    min-height: 260px;
+}
+
+.category-chart-layout {
+    min-height: 260px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+}
+
+.category-chart-ring {
+    width: min(190px, 42%);
+    aspect-ratio: 1;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    position: relative;
+}
+
+.category-chart-ring::before {
+    content: "";
+    position: absolute;
+    inset: 22%;
+    border-radius: 50%;
+    background: var(--bg-elevated);
+}
+
+.category-chart-center {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    max-width: 72%;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.category-chart-center strong {
+    color: var(--text);
+    font-size: 14px;
+    overflow-wrap: anywhere;
+}
+
+.category-chart-legend {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    width: min(100%, 330px);
+    max-height: 260px;
+    overflow: auto;
+}
+
+.category-chart-legend li {
+    display: grid;
+    grid-template-columns: 9px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 0;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.category-chart-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.category-chart-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.category-chart-value {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+.monthly-chart svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+}
+
+.chart-empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 90px 12px;
+}
+
+.trend-chart {
+    min-height: 180px;
+}
+
+.trend-chart svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+}
+
+@media (max-width: 768px) {
+    .category-chart-layout {
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .category-chart-ring {
+        width: min(190px, 70%);
+    }
+
+    .category-chart-legend {
+        max-height: 180px;
+    }
 }
 
 /* ─── Tables ───────────────────────────────────────────────────── */
@@ -1261,7 +1383,7 @@ td.amount.income {
 }
 
 .settings-overview-link:hover {
-    text-decoration: underline;
+    text-decoration: none;
 }
 
 .settings-nav {

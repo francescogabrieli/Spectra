@@ -1,9 +1,9 @@
 """Tests for the AI categoriser — prompt building and JSON parsing."""
 
 from spectra.ai import (
-    CategorisedTransaction,
     _build_user_prompt,
     _extract_json,
+    categorise,
 )
 
 
@@ -85,3 +85,94 @@ class TestExtractJson:
 
     def test_empty_array(self) -> None:
         assert _extract_json("[]") == []
+
+
+def test_model_can_only_enrich_source_rows(monkeypatch) -> None:
+    import json
+    import spectra.ai
+
+    monkeypatch.setattr(
+        spectra.ai,
+        "_call_gemini",
+        lambda *_args: json.dumps([
+            {
+                "id": "source-row",
+                "original": "BANK DESCRIPTION",
+                "clean_name": "Market",
+                "category": "Food",
+                "amount": -90,
+                "currency": "EUR",
+                "date": "1999-01-01",
+                "recurring": "Subscription",
+            },
+            {
+                "id": "invented-row",
+                "original": "UNMATCHED SOURCE",
+                "clean_name": "Invented",
+                "category": "Shopping",
+                "amount": -1,
+                "currency": "EUR",
+                "date": "2026-02-22",
+            },
+        ]),
+    )
+    source = {
+        "id": "source-row",
+        "raw_description": "BANK DESCRIPTION",
+        "amount": -100.25,
+        "amount_decimal": "-100.25",
+        "currency": "USD",
+        "date": "2026-02-22",
+        "counterpart": "Merchant of record",
+        "account_name": "Card",
+        "account_id": "acct-123",
+        "statement_category": "Statement category",
+    }
+
+    results = categorise(
+        [source], [], provider="gemini", api_key="test-only", model="mocked",
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.id == "source-row"
+    assert result.amount == -100.25
+    assert result.currency == "USD"
+    assert result.date == "2026-02-22"
+    assert result.original_description == "BANK DESCRIPTION"
+    assert result.counterpart == "Merchant of record"
+    assert result.account_id == "acct-123"
+    assert result.category == "Food"
+    assert result.clean_name == "Market"
+    assert result.recurring == "Subscription"
+
+
+def test_incomplete_ai_output_is_visible_and_parse_errors_do_not_log_financial_text(
+    caplog,
+    monkeypatch,
+) -> None:
+    import json
+    import spectra.ai
+
+    source_rows = [
+        {"id": "row-1", "raw_description": "FIRST", "amount": -1, "currency": "EUR", "date": "2026-01-01"},
+        {"id": "row-2", "raw_description": "SECOND", "amount": -2, "currency": "EUR", "date": "2026-01-02"},
+    ]
+    monkeypatch.setattr(
+        spectra.ai,
+        "_call_gemini",
+        lambda *_args: json.dumps([{
+            "id": "row-1", "original": "FIRST", "clean_name": "Merchant",
+            "category": "Food", "amount": -1, "currency": "EUR", "date": "2026-01-01",
+        }]),
+    )
+    results = categorise(
+        source_rows, [], provider="gemini", api_key="test-only", model="mocked",
+    )
+    assert [item.id for item in results] == ["row-1", "row-2"]
+    assert results[1].category == "Uncategorized"
+    assert results[1].needs_review is True
+
+    with caplog.at_level("ERROR", logger="spectra.ai"):
+        assert _extract_json("sensitive account detail 998877 cannot parse") == []
+    assert "998877" not in caplog.text
